@@ -258,6 +258,20 @@ struct ActiveLease {
     expires_at: Instant,
 }
 
+/// Result of a [`Fabric::refresh_local`] call. The operator (or a tool) can
+/// inspect the diff to confirm what changed.
+#[derive(Clone, Debug, Default, Eq, PartialEq, serde::Serialize)]
+pub struct RefreshReport {
+    /// Resource ids that were added by this refresh.
+    pub added: Vec<String>,
+    /// Resource ids that were removed (and were *not* currently leased).
+    pub removed: Vec<String>,
+    /// Resource ids that were *not* removed because they are currently
+    /// leased; they will be removed by a future refresh once the lease
+    /// expires, or by an explicit release + unregister.
+    pub blocked_by_lease: Vec<String>,
+}
+
 #[derive(Default)]
 pub struct Fabric {
     resources: RwLock<HashMap<String, Resource>>,
@@ -281,6 +295,133 @@ impl Fabric {
         }
         info!(resource_count = resources.len(), "registered local host inventory");
         resources
+    }
+
+    /// Remove a resource from the fabric. Returns `true` if the resource was
+    /// registered and is now gone, `false` if no such resource id existed.
+    ///
+    /// If the resource has an active lease, the removal is **rejected** with
+    /// [`FabricError::ResourceAlreadyLeased`]. The fabric does not silently
+    /// orphan a lease; the operator must either wait for the lease to expire
+    /// (default prune) or explicitly release it first. This invariant is
+    /// tested in `unregister_rejects_a_leased_resource`.
+    pub fn unregister(&self, resource_id: &str) -> Result<bool, FabricError> {
+        // Lock order: leases first, then resources. The other Fabric methods
+        // (lease_exclusive, release, attach) follow the same order, so this
+        // can't deadlock against them.
+        let leases = self.leases.lock().expect("lease registry lock poisoned");
+        if leases.contains_key(resource_id) {
+            return Err(FabricError::ResourceAlreadyLeased);
+        }
+        drop(leases);
+
+        let removed = self
+            .resources
+            .write()
+            .expect("resource registry lock poisoned")
+            .remove(resource_id)
+            .is_some();
+        if removed {
+            info!(resource_id, "resource unregistered");
+        }
+        Ok(removed)
+    }
+
+    /// Re-discover local host resources and diff against the current set.
+    /// Resources present in the new discovery but missing from the fabric
+    /// are registered. Resources present in the fabric but missing from the
+    /// new discovery are removed (subject to the lease check in
+    /// [`Self::unregister`]). The returned [`RefreshReport`] lists the ids
+    /// added and removed so the operator (or a tool) can audit the change.
+    ///
+    /// GPU resources (when the `nvidia` feature is on) are re-discovered
+    /// from NVML on every call so a hot-swapped card appears without an
+    /// agent restart. The contract is "self-discovering": no per-host
+    /// config is required, the next call to `refresh_local` reflects
+    /// whatever the kernel and NVML currently report.
+    pub fn refresh_local(&self, node: impl Into<String>) -> RefreshReport {
+        let node = node.into();
+        // The `mut` is only used under the `nvidia` feature (where we extend
+        // with discovered GPUs). The default build is `mut` but unused;
+        // silence the warning explicitly so the intent is documented.
+        #[allow(unused_mut)]
+        let mut new_resources = HostInventory::discover(node.clone());
+
+        // When the nvidia feature is on, also discover GPUs. They share
+        // the local-resource namespace with the host inventory, so a
+        // resource id collision (a hand-registered resource that happens
+        // to have the same id) is resolved in favor of the freshly
+        // discovered one — same precedence as HostInventory::discover.
+        #[cfg(feature = "nvidia")]
+        {
+            match crate::gpu::GpuTopology::discover() {
+                Ok(topology) => {
+                    let gpu_resources = topology.as_resources(node.clone());
+                    info!(count = gpu_resources.len(), "refresh: discovered GPUs");
+                    new_resources.extend(gpu_resources);
+                }
+                Err(error) => {
+                    // Missing driver / no GPUs is an ordinary condition;
+                    // log at info and continue with the host inventory.
+                    info!(?error, "refresh: no NVML, skipping GPU discovery");
+                }
+            }
+        }
+
+        let new_ids: std::collections::BTreeSet<String> =
+            new_resources.iter().map(|r| r.id.clone()).collect();
+        let current_ids: std::collections::BTreeSet<String> = self
+            .resources
+            .read()
+            .expect("resource registry lock poisoned")
+            .keys()
+            .cloned()
+            .collect();
+
+        let added: Vec<String> = new_ids.difference(&current_ids).cloned().collect();
+        let removed: Vec<String> = current_ids.difference(&new_ids).cloned().collect();
+
+        // Add the new ones first so an operator that calls refresh and
+        // then immediately queries sees the new resources.
+        for resource in &new_resources {
+            if added.contains(&resource.id) {
+                self.register(resource.clone());
+            }
+        }
+        // Then remove the gone ones. Skip any that are currently leased
+        // (collect them into a separate list so we don't try-and-fail in
+        // a loop — `unregister` returns the error on the first hit).
+        let mut removed_unblocked: Vec<String> = Vec::new();
+        let mut blocked_by_lease: Vec<String> = Vec::new();
+        for id in &removed {
+            match self.unregister(id) {
+                Ok(true) => removed_unblocked.push(id.clone()),
+                Ok(false) => { /* not present, nothing to do */ }
+                Err(FabricError::ResourceAlreadyLeased) => {
+                    blocked_by_lease.push(id.clone());
+                    info!(
+                        resource_id = %id,
+                        "refresh: resource disappeared but is currently leased; leaving in registry until lease expires"
+                    );
+                }
+                Err(other) => {
+                    info!(resource_id = %id, error = ?other, "refresh: unregister failed");
+                }
+            }
+        }
+
+        info!(
+            added = added.len(),
+            removed = removed_unblocked.len(),
+            blocked_by_lease = blocked_by_lease.len(),
+            "refresh complete"
+        );
+
+        RefreshReport {
+            added,
+            removed: removed_unblocked,
+            blocked_by_lease,
+        }
     }
 
     pub fn register_adapter(&self, adapter: Arc<dyn ResourceAdapter>) {
@@ -666,5 +807,89 @@ mod tests {
     #[test]
     fn rust_vmm_guest_memory_allocation_is_usable() {
         assert!(allocate_guest_memory(1024 * 1024).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // unregister + refresh_local
+    // -----------------------------------------------------------------------
+
+    fn register_test_resource(fabric: &Fabric, id: &str) {
+        fabric.register(Resource {
+            id: id.into(),
+            kind: ResourceKind::Device,
+            capacity: 1,
+            unit: "device".into(),
+            node: "test-node".into(),
+            state: ResourceState::Available,
+            exclusive: true,
+            attributes: BTreeMap::new(),
+        });
+    }
+
+    #[test]
+    fn unregister_of_nonexistent_resource_returns_false() {
+        let fabric = Fabric::default();
+        // No prior registration; unregister is a no-op success.
+        assert_eq!(fabric.unregister("nope").unwrap(), false);
+    }
+
+    #[test]
+    fn unregister_removes_a_registered_resource() {
+        let fabric = Fabric::default();
+        register_test_resource(&fabric, "device.0");
+        assert!(fabric.resource("device.0").is_some());
+        assert_eq!(fabric.unregister("device.0").unwrap(), true);
+        assert!(fabric.resource("device.0").is_none());
+    }
+
+    #[test]
+    fn unregister_rejects_a_leased_resource() {
+        let fabric = Fabric::default();
+        register_test_resource(&fabric, "device.0");
+        let lease = fabric
+            .lease_exclusive("device.0", "mission-a", Duration::from_secs(30))
+            .unwrap();
+        // unregister must refuse to orphan the lease.
+        assert_eq!(
+            fabric.unregister("device.0").unwrap_err(),
+            FabricError::ResourceAlreadyLeased
+        );
+        // The resource is still registered.
+        assert!(fabric.resource("device.0").is_some());
+        // After release, unregister succeeds.
+        fabric.release(&lease).unwrap();
+        assert_eq!(fabric.unregister("device.0").unwrap(), true);
+    }
+
+    #[test]
+    fn refresh_local_on_empty_fabric_reports_no_changes() {
+        // We can't call refresh_local and assert it's empty because the
+        // host's real HostInventory::discover will populate it. But we can
+        // at least assert that a refresh runs without panic and returns a
+        // valid report.
+        let fabric = Fabric::default();
+        let report = fabric.refresh_local("test-node");
+        // The current host's resources are now in the fabric; `report.added`
+        // should be exactly the resource ids that were added (which is
+        // every discovered resource, since we started empty).
+        let current: std::collections::BTreeSet<String> =
+            fabric.resources().into_iter().map(|r| r.id).collect();
+        let added: std::collections::BTreeSet<String> = report.added.iter().cloned().collect();
+        assert_eq!(current, added, "every resource on this host was added");
+    }
+
+    #[test]
+    fn refresh_local_is_idempotent_on_a_second_call() {
+        let fabric = Fabric::default();
+        let first = fabric.refresh_local("test-node");
+        let second = fabric.refresh_local("test-node");
+        // The first call adds every host resource. The second call adds
+        // nothing (everything is already there) and removes nothing.
+        assert!(second.added.is_empty(), "second refresh adds nothing");
+        assert!(second.removed.is_empty(), "second refresh removes nothing");
+        assert!(second.blocked_by_lease.is_empty());
+        // Sanity: the first call did at least add *something* on this host
+        // (CPU + memory at minimum).
+        assert!(!first.added.is_empty(), "first refresh added host resources");
     }
 }

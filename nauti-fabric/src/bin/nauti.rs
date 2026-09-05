@@ -46,6 +46,13 @@ enum Command {
         json: bool,
         #[arg(long, default_value = "local")]
         node: String,
+        /// Re-discover local resources (host inventory + NVML GPUs when
+        /// the `nvidia` feature is on) and diff against the current set
+        /// before listing. Useful after a hot-swap of a GPU or any other
+        /// device: the next refresh reflects whatever the kernel and
+        /// NVML currently report, no agent restart required.
+        #[arg(long)]
+        refresh: bool,
     },
     /// Run the complete single-host resource lifecycle proof.
     Demo,
@@ -131,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Command::Tools { json } => tools(json),
         Command::Adapters { json } => adapters(json),
-        Command::Inventory { json, node } => inventory(&node, json),
+        Command::Inventory { json, node, refresh } => inventory(&node, json, refresh),
         Command::Demo => demo(),
         Command::AgentServe { node } => agent_serve(&node),
         Command::AgentConnect { addr } => agent_connect(&addr),
@@ -260,24 +267,57 @@ fn gpus(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn inventory(node: &str, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn inventory(node: &str, json: bool, refresh: bool) -> Result<(), Box<dyn std::error::Error>> {
     let fabric = Fabric::default();
-    fabric.discover_local(node);
-    let resources = fabric.resources();
-    if json {
-        println!("{}", serde_json::to_string_pretty(&resources)?);
+    if refresh {
+        // Self-discovering path: re-run HostInventory::discover (+ NVML
+        // when the nvidia feature is on), diff against the current
+        // fabric, and emit the diff so the operator (or a tool) can
+        // audit what changed.
+        let report = fabric.refresh_local(node);
+        if json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("REPORT: added={} removed={} blocked_by_lease={}",
+                report.added.len(), report.removed.len(), report.blocked_by_lease.len());
+            if !report.added.is_empty() {
+                println!("ADDED:");
+                for id in &report.added {
+                    println!("  + {id}");
+                }
+            }
+            if !report.removed.is_empty() {
+                println!("REMOVED:");
+                for id in &report.removed {
+                    println!("  - {id}");
+                }
+            }
+            if !report.blocked_by_lease.is_empty() {
+                println!("BLOCKED_BY_LEASE (will be removed once lease expires or is released):");
+                for id in &report.blocked_by_lease {
+                    println!("  ! {id}");
+                }
+            }
+        }
     } else {
-        println!("ID\tKIND\tCAPACITY\tUNIT\tNODE\tSTATE");
-        for resource in resources {
-            println!(
-                "{}\t{:?}\t{}\t{}\t{}\t{:?}",
-                resource.id,
-                resource.kind,
-                resource.capacity,
-                resource.unit,
-                resource.node,
-                resource.state
-            );
+        // Original path: discover once, list.
+        fabric.discover_local(node);
+        let resources = fabric.resources();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&resources)?);
+        } else {
+            println!("ID\tKIND\tCAPACITY\tUNIT\tNODE\tSTATE");
+            for resource in resources {
+                println!(
+                    "{}\t{:?}\t{}\t{}\t{}\t{:?}",
+                    resource.id,
+                    resource.kind,
+                    resource.capacity,
+                    resource.unit,
+                    resource.node,
+                    resource.state
+                );
+            }
         }
     }
     Ok(())
