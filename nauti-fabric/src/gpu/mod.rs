@@ -148,3 +148,4 @@ mod tests {
         }
     }
 }
+pub mod adapter;
