@@ -53,6 +53,13 @@ enum Command {
         /// JSON-encoded `EndpointAddr` printed by `agent-serve`.
         addr: String,
     },
+    /// Probe local NUMA/PCI topology via hwloc (requires the `numa` build feature).
+    #[cfg(feature = "numa")]
+    Topology {
+        /// Emit the topology report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,6 +70,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Demo => demo(),
         Command::AgentServe { node } => agent_serve(&node),
         Command::AgentConnect { addr } => agent_connect(&addr),
+        #[cfg(feature = "numa")]
+        Command::Topology { json } => topology(json),
     }
 }
 
@@ -98,6 +107,34 @@ fn adapters(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("NAME\tSCOPE\tHEALTHY");
         for report in reports {
             println!("{}\t{}\t{}", report.name, report.scope, report.healthy);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "numa")]
+fn topology(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let topology = nauti_fabric::topology::NumaTopology::discover()?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(topology.nodes())?);
+    } else {
+        println!("NODE\tMEMORY_BYTES\tLOGICAL_CPUS\tPCI_DEVICES");
+        for node in topology.nodes() {
+            println!(
+                "{}\t{}\t{}\t{}",
+                node.os_index,
+                node.local_memory_bytes,
+                node.logical_cpus,
+                node.pci_devices.len()
+            );
+            for pci in &node.pci_devices {
+                println!(
+                    "  - {} (vendor={:?} device={:?})",
+                    pci.name, pci.vendor_id, pci.device_id
+                );
+            }
         }
     }
 

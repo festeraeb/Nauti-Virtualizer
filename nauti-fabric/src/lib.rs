@@ -2,6 +2,8 @@
 
 pub mod adapters;
 pub mod rpc;
+#[cfg(feature = "numa")]
+pub mod topology;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};

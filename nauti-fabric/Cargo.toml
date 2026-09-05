@@ -15,3 +15,7 @@ vm-memory = { version = "0.18.0", features = ["backend-mmap"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util", "signal"] }
 iroh = "1.1.0"
 anyhow = "1"
+hwlocality = { version = "1.0.0-alpha.12", optional = true }
+
+[features]
+numa = ["dep:hwlocality"]
