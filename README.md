@@ -20,4 +20,4 @@ Cloud Hypervisor, rust-vmm, vhost-device, Iroh/QUIC, VFIO, and hardware-specific
 
 The eventual Strand LoRA adapter creator should be constrained by the adapter contract and must produce tests for lease, capability, health, failure, and cleanup behavior. It should generate thin integrations around upstream components, never duplicate a VMM or transport stack.
 
-The seed truth-grounded and adversarial LoRA corpus is in [training/adapter_creator_dataset.jsonl](training/adapter_creator_dataset.jsonl), with curation rules and provenance in [training/DATASET_NOTES.md](training/DATASET_NOTES.md).
+A LoRA fine-tuning corpus and its curation rules are maintained in a separate fine-tuning repository (not bundled with this crate). A plug-in validation tool for anyone curating a corpus in the same shape lives in `tools/dataset-validate/`; it is built on demand with `cargo run -p dataset-validate -- <path-to-corpus.jsonl>` and is **not** a build or test-time dependency of the deployable crate.

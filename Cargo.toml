@@ -1,3 +1,3 @@
 [workspace]
-members = ["nauti-fabric"]
+members = ["nauti-fabric", "tools/dataset-validate"]
 resolver = "2"

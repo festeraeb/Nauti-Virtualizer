@@ -1,0 +1,16 @@
+[package]
+name = "dataset-validate"
+version = "0.1.0"
+edition = "2024"
+description = "Validate a LoRA fine-tuning corpus (JSONL of chat records) against the v0.1.0 schema and grounding rules. Optional tool, not a build-time dependency of the deployable project."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[dependencies]
+serde_json = "1.0.149"
+regex = "1.10"
+thiserror = "2.0.20"
+
+[[bin]]
+name = "dataset-validate"
+path = "src/main.rs"
