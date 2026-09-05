@@ -30,8 +30,9 @@ use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, endpoint::presets};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::rpc_auth::{AuthProvider, NoAuth, RequestContext};
 use crate::{Attachment, Fabric, FabricError, Lease, Resource, ResourceRequest};
 
 /// ALPN identifying the nauti-fabric agent RPC protocol.
@@ -185,24 +186,47 @@ fn dispatch(fabric: &Fabric, request: RpcRequest) -> RpcResponse {
 #[derive(Clone)]
 pub struct FabricAgent {
     fabric: Arc<Fabric>,
+    auth: Arc<dyn AuthProvider>,
+    local_endpoint_id: String,
 }
 
 impl std::fmt::Debug for FabricAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FabricAgent").finish_non_exhaustive()
+        f.debug_struct("FabricAgent")
+            .field("auth", &self.auth.name())
+            .field("local_endpoint_id", &self.local_endpoint_id)
+            .finish_non_exhaustive()
     }
 }
 
 impl FabricAgent {
+    /// Build a `FabricAgent` that uses [`NoAuth`] (the default). Equivalent to
+    /// the pre-auth-plug-in-spot behavior; every request is accepted.
     pub fn new(fabric: Arc<Fabric>) -> Self {
-        Self { fabric }
+        Self::with_auth(fabric, Arc::new(NoAuth), "local".to_string())
+    }
+
+    /// Build a `FabricAgent` with an explicit [`AuthProvider`]. The
+    /// `local_endpoint_id` is recorded in the [`RequestContext`] passed to
+    /// the provider so multi-agent deployments can distinguish themselves.
+    pub fn with_auth(
+        fabric: Arc<Fabric>,
+        auth: Arc<dyn AuthProvider>,
+        local_endpoint_id: String,
+    ) -> Self {
+        Self { fabric, auth, local_endpoint_id }
     }
 }
 
 impl ProtocolHandler for FabricAgent {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let remote_id = connection.remote_id();
-        info!(%remote_id, "nauti agent: accepted rpc connection");
+        info!(%remote_id, auth = self.auth.name(), "nauti agent: accepted rpc connection");
+
+        let ctx = RequestContext {
+            remote_endpoint_id: remote_id.to_string(),
+            local_endpoint_id: self.local_endpoint_id.clone(),
+        };
 
         let (mut send, mut recv) = connection.accept_bi().await?;
 
@@ -212,7 +236,16 @@ impl ProtocolHandler for FabricAgent {
                 Err(RpcTransportError::ConnectionClosed) => break,
                 Err(error) => return Err(AcceptError::from_err(error)),
             };
-            let response = dispatch(&self.fabric, request);
+            let response = match self.auth.authorize(&ctx, &request) {
+                Ok(()) => dispatch(&self.fabric, request),
+                Err(rejection) => {
+                    warn!(
+                        %remote_id, auth = self.auth.name(), ?rejection,
+                        "nauti agent: rejected request at auth layer"
+                    );
+                    RpcResponse::Error(crate::rpc::RpcError::from(rejection))
+                }
+            };
             write_frame(&mut send, &response).await.map_err(AcceptError::from_err)?;
         }
 
@@ -226,13 +259,26 @@ impl ProtocolHandler for FabricAgent {
 /// Starts serving the fabric agent RPC protocol on a freshly bound Iroh
 /// endpoint and returns the running [`Router`] plus the [`EndpointAddr`]
 /// callers must share (out-of-band) with a controller so it can connect.
+///
+/// Uses [`NoAuth`]; see [`serve_with_auth`] for an explicit provider.
 pub async fn serve(fabric: Arc<Fabric>) -> Result<(Router, EndpointAddr), RpcTransportError> {
+    serve_with_auth(fabric, Arc::new(NoAuth)).await
+}
+
+/// Like [`serve`], but with an explicit [`AuthProvider`]. The provider is
+/// consulted on every request before [`dispatch`].
+pub async fn serve_with_auth(
+    fabric: Arc<Fabric>,
+    auth: Arc<dyn AuthProvider>,
+) -> Result<(Router, EndpointAddr), RpcTransportError> {
     let endpoint = Endpoint::bind(presets::N0)
         .await
         .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
     endpoint.online().await;
     let addr = endpoint.addr();
-    let router = Router::builder(endpoint).accept(ALPN, FabricAgent::new(fabric)).spawn();
+    let local_endpoint_id = endpoint.id().to_string();
+    let agent = FabricAgent::with_auth(fabric, auth, local_endpoint_id);
+    let router = Router::builder(endpoint).accept(ALPN, agent).spawn();
     Ok((router, addr))
 }
 

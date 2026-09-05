@@ -4,6 +4,7 @@ pub mod adapters;
 #[cfg(feature = "nvidia")]
 pub mod gpu;
 pub mod rpc;
+pub mod rpc_auth;
 #[cfg(feature = "numa")]
 pub mod topology;
 #[cfg(feature = "cloud-hypervisor")]
