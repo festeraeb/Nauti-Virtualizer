@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{Attachment, FabricError, Lease, Resource, ResourceAdapter, ResourceKind};
+use crate::{AdapterReport, Attachment, FabricError, Lease, Resource, ResourceAdapter};
 
 fn attachment(resource: &Resource, lease: &Lease, adapter: &str, details: BTreeMap<String, String>) -> Attachment {
     Attachment {
@@ -36,6 +36,15 @@ impl ResourceAdapter for LocalResourceAdapter {
             self.name(),
             BTreeMap::from([("attachment.scope".into(), "local".into())]),
         ))
+    }
+
+    fn capability_report(&self) -> AdapterReport {
+        AdapterReport {
+            name: self.name().into(),
+            scope: "local-host".into(),
+            healthy: true,
+            detail: BTreeMap::from([("resource.locality".into(), "local".into())]),
+        }
     }
 }
 
@@ -81,12 +90,21 @@ impl ResourceAdapter for NetworkResourceAdapter {
             ]),
         ))
     }
+
+    fn capability_report(&self) -> AdapterReport {
+        AdapterReport {
+            name: self.name().into(),
+            scope: "remote-descriptor".into(),
+            healthy: true,
+            detail: BTreeMap::from([("resource.locality".into(), "remote".into())]),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ResourceState;
+    use crate::{ResourceKind, ResourceState};
 
     fn resource(node: &str, attributes: BTreeMap<String, String>) -> Resource {
         Resource {
@@ -123,5 +141,21 @@ mod tests {
         let attachment = NetworkResourceAdapter.attach(&remote, &lease()).unwrap();
         assert_eq!(attachment.details["attachment.scope"], "network");
         assert_eq!(attachment.details["protocol"], "quic");
+    }
+
+    #[test]
+    fn local_adapter_reports_healthy_local_scope() {
+        let report = LocalResourceAdapter.capability_report();
+        assert_eq!(report.name, "local-resource");
+        assert_eq!(report.scope, "local-host");
+        assert!(report.healthy);
+    }
+
+    #[test]
+    fn network_adapter_reports_healthy_remote_scope() {
+        let report = NetworkResourceAdapter.capability_report();
+        assert_eq!(report.name, "network-resource");
+        assert_eq!(report.scope, "remote-descriptor");
+        assert!(report.healthy);
     }
 }

@@ -4,18 +4,12 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use nauti_fabric::rpc::{AgentClient, RpcRequest, RpcResponse};
-use nauti_fabric::{Fabric, LocalProofAdapter, LocalResourceAdapter, NetworkResourceAdapter, Resource, ResourceAdapter, ResourceKind, ResourceState};
+use nauti_fabric::{Fabric, LocalProofAdapter, LocalResourceAdapter, NetworkResourceAdapter, Resource, ResourceKind, ResourceState};
 
 #[derive(serde::Serialize)]
 struct ToolInfo {
     name: &'static str,
     purpose: &'static str,
-}
-
-#[derive(serde::Serialize)]
-struct AdapterInfo {
-    name: String,
-    scope: &'static str,
 }
 
 #[derive(Parser)]
@@ -92,21 +86,18 @@ fn tools(json: bool) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn adapters(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let proof_adapter = LocalProofAdapter;
-    let local_adapter = LocalResourceAdapter;
-    let network_adapter = NetworkResourceAdapter;
-    let adapters = vec![
-        AdapterInfo { name: proof_adapter.name().into(), scope: "proof-only" },
-        AdapterInfo { name: local_adapter.name().into(), scope: "local-host" },
-        AdapterInfo { name: network_adapter.name().into(), scope: "remote-descriptor" },
-    ];
+    let fabric = Fabric::default();
+    fabric.register_adapter(Arc::new(LocalProofAdapter));
+    fabric.register_adapter(Arc::new(LocalResourceAdapter));
+    fabric.register_adapter(Arc::new(NetworkResourceAdapter));
+    let reports = fabric.adapter_reports();
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&adapters)?);
+        println!("{}", serde_json::to_string_pretty(&reports)?);
     } else {
-        println!("NAME\tSCOPE");
-        for adapter in adapters {
-            println!("{}\t{}", adapter.name, adapter.scope);
+        println!("NAME\tSCOPE\tHEALTHY");
+        for report in reports {
+            println!("{}\t{}\t{}", report.name, report.scope, report.healthy);
         }
     }
 

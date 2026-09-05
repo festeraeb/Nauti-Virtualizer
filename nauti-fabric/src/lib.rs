@@ -164,10 +164,39 @@ pub struct Attachment {
     pub details: BTreeMap<String, String>,
 }
 
+/// A capability/health snapshot for a registered [`ResourceAdapter`].
+///
+/// Adapters are stateless attach-time strategies, so "health" here means
+/// whether the adapter is currently able to accept attach calls (for
+/// example, a network adapter could report unhealthy if its transport
+/// dependency is unreachable). `scope` is a short machine-readable label
+/// describing what the adapter operates on (`local-host`, `remote-descriptor`,
+/// `proof-only`, ...), and `detail` carries adapter-specific diagnostics.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AdapterReport {
+    pub name: String,
+    pub scope: String,
+    pub healthy: bool,
+    pub detail: BTreeMap<String, String>,
+}
+
 pub trait ResourceAdapter: Send + Sync {
     fn name(&self) -> &str;
 
     fn attach(&self, resource: &Resource, lease: &Lease) -> Result<Attachment, FabricError>;
+
+    /// Reports this adapter's capability scope and current health.
+    ///
+    /// The default implementation assumes a stateless, always-healthy
+    /// adapter; override it for adapters with external dependencies.
+    fn capability_report(&self) -> AdapterReport {
+        AdapterReport {
+            name: self.name().into(),
+            scope: "unspecified".into(),
+            healthy: true,
+            detail: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -250,6 +279,19 @@ impl Fabric {
             .write()
             .expect("adapter registry lock poisoned")
             .insert(adapter.name().into(), adapter);
+    }
+
+    /// Collects a capability/health report from every registered adapter.
+    pub fn adapter_reports(&self) -> Vec<AdapterReport> {
+        let mut reports: Vec<_> = self
+            .adapters
+            .read()
+            .expect("adapter registry lock poisoned")
+            .values()
+            .map(|adapter| adapter.capability_report())
+            .collect();
+        reports.sort_by(|left, right| left.name.cmp(&right.name));
+        reports
     }
 
     pub fn resource(&self, resource_id: &str) -> Option<Resource> {
@@ -348,6 +390,23 @@ impl Fabric {
                 leases.remove(&lease.resource_id);
                 info!(resource_id = lease.resource_id, lease_id = lease.id, "resource released");
                 Ok(())
+            }
+            _ => Err(FabricError::LeaseNotFound),
+        }
+    }
+
+    /// Extends an active lease's expiry by `ttl` from now, provided the
+    /// caller presents the exact lease that is currently active (and not
+    /// already expired) for that resource. Renewing does not change the
+    /// lease `id`, so any already-attached [`Attachment`] remains valid.
+    pub fn renew_lease(&self, lease: &Lease, ttl: Duration) -> Result<Lease, FabricError> {
+        let mut leases = self.leases.lock().expect("lease registry lock poisoned");
+        leases.retain(|_, active| active.expires_at > Instant::now());
+        match leases.get_mut(&lease.resource_id) {
+            Some(active) if active.lease.id == lease.id => {
+                active.expires_at = Instant::now() + ttl;
+                info!(resource_id = lease.resource_id, lease_id = lease.id, "lease renewed");
+                Ok(active.lease.clone())
             }
             _ => Err(FabricError::LeaseNotFound),
         }
@@ -482,6 +541,117 @@ mod tests {
             .unwrap();
 
         assert_eq!(fabric.attach("local-proof", &lease).unwrap().lease_id, lease.id);
+    }
+
+    fn register_gpu(fabric: &Fabric) {
+        fabric.register(Resource {
+            id: "gpu.local.0".into(),
+            kind: ResourceKind::Gpu,
+            capacity: 1,
+            unit: "device".into(),
+            node: "local".into(),
+            state: ResourceState::Available,
+            exclusive: true,
+            attributes: BTreeMap::new(),
+        });
+    }
+
+    #[test]
+    fn expired_lease_is_pruned_and_resource_becomes_available_again() {
+        let fabric = Fabric::default();
+        register_gpu(&fabric);
+
+        fabric
+            .lease_exclusive("gpu.local.0", "mission-a", Duration::from_millis(20))
+            .expect("first lease should succeed");
+        std::thread::sleep(Duration::from_millis(60));
+
+        assert!(fabric
+            .lease_exclusive("gpu.local.0", "mission-b", Duration::from_secs(30))
+            .is_ok());
+    }
+
+    #[test]
+    fn attach_rejects_a_lease_that_has_already_expired() {
+        let fabric = Fabric::default();
+        register_gpu(&fabric);
+        fabric.register_adapter(Arc::new(LocalProofAdapter));
+
+        let lease = fabric
+            .lease_exclusive("gpu.local.0", "mission-a", Duration::from_millis(20))
+            .expect("first lease should succeed");
+        std::thread::sleep(Duration::from_millis(60));
+
+        assert_eq!(fabric.attach("local-proof", &lease), Err(FabricError::LeaseNotFound));
+    }
+
+    #[test]
+    fn renewing_a_lease_extends_it_past_its_original_ttl() {
+        let fabric = Fabric::default();
+        register_gpu(&fabric);
+        fabric.register_adapter(Arc::new(LocalProofAdapter));
+
+        let lease = fabric
+            .lease_exclusive("gpu.local.0", "mission-a", Duration::from_millis(40))
+            .expect("first lease should succeed");
+
+        std::thread::sleep(Duration::from_millis(20));
+        let renewed = fabric
+            .renew_lease(&lease, Duration::from_millis(200))
+            .expect("active lease can be renewed");
+        assert_eq!(renewed.id, lease.id);
+
+        // Past the *original* ttl, but the renewal should keep it alive.
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(fabric.attach("local-proof", &lease).is_ok());
+        assert_eq!(
+            fabric.lease_exclusive("gpu.local.0", "mission-b", Duration::from_secs(30)),
+            Err(FabricError::ResourceAlreadyLeased)
+        );
+    }
+
+    #[test]
+    fn renewing_an_expired_lease_fails() {
+        let fabric = Fabric::default();
+        register_gpu(&fabric);
+
+        let lease = fabric
+            .lease_exclusive("gpu.local.0", "mission-a", Duration::from_millis(20))
+            .expect("first lease should succeed");
+        std::thread::sleep(Duration::from_millis(60));
+
+        assert_eq!(
+            fabric.renew_lease(&lease, Duration::from_secs(30)),
+            Err(FabricError::LeaseNotFound)
+        );
+    }
+
+    #[test]
+    fn renewing_an_unknown_lease_fails() {
+        let fabric = Fabric::default();
+        register_gpu(&fabric);
+        let bogus = Lease { id: 999, resource_id: "gpu.local.0".into(), owner: "nobody".into() };
+        assert_eq!(
+            fabric.renew_lease(&bogus, Duration::from_secs(30)),
+            Err(FabricError::LeaseNotFound)
+        );
+    }
+
+    #[test]
+    fn adapter_reports_are_sorted_and_include_default_scope() {
+        let fabric = Fabric::default();
+        fabric.register_adapter(Arc::new(LocalProofAdapter));
+        fabric.register_adapter(Arc::new(LocalResourceAdapter));
+        fabric.register_adapter(Arc::new(NetworkResourceAdapter));
+
+        let reports = fabric.adapter_reports();
+        let names: Vec<_> = reports.iter().map(|report| report.name.as_str()).collect();
+        assert_eq!(names, ["local-proof", "local-resource", "network-resource"]);
+        assert!(reports.iter().all(|report| report.healthy));
+        assert_eq!(
+            reports.iter().find(|report| report.name == "local-proof").unwrap().scope,
+            "unspecified"
+        );
     }
 
     #[test]
