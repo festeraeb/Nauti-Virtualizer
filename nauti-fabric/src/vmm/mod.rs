@@ -12,4 +12,10 @@
 
 mod cloud_hypervisor;
 
+#[cfg(feature = "vfio")]
+mod vfio;
+
 pub use cloud_hypervisor::{CloudHypervisorAdapter, Launcher, ProcessLauncher, VmResourceSpec};
+
+#[cfg(feature = "vfio")]
+pub use vfio::{RealVfioLauncher, VfioDiscovery, VfioGpuAdapter, VfioLauncher, VfioState};
