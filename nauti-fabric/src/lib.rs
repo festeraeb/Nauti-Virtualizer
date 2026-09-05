@@ -1,6 +1,8 @@
 //! Foundational resource model and local, exclusive lease proof of concept.
 
 pub mod adapters;
+#[cfg(feature = "nvidia")]
+pub mod gpu;
 pub mod rpc;
 #[cfg(feature = "numa")]
 pub mod topology;

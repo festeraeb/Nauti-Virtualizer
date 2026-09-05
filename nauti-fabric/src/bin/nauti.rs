@@ -60,6 +60,13 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Probe local NVIDIA GPUs via NVML (requires the `nvidia` build feature).
+    #[cfg(feature = "nvidia")]
+    Gpus {
+        /// Emit the GPU report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -72,6 +79,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::AgentConnect { addr } => agent_connect(&addr),
         #[cfg(feature = "numa")]
         Command::Topology { json } => topology(json),
+        #[cfg(feature = "nvidia")]
+        Command::Gpus { json } => gpus(json),
     }
 }
 
@@ -135,6 +144,30 @@ fn topology(json: bool) -> Result<(), Box<dyn std::error::Error>> {
                     pci.name, pci.vendor_id, pci.device_id
                 );
             }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "nvidia")]
+fn gpus(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let topology = nauti_fabric::gpu::GpuTopology::discover()?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(topology.devices())?);
+    } else {
+        println!("INDEX\tNAME\tUUID\tTOTAL_BYTES\tFREE_BYTES\tPCI_BUS_ID");
+        for gpu in topology.devices() {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                gpu.index,
+                gpu.name,
+                gpu.uuid,
+                gpu.total_memory_bytes,
+                gpu.free_memory_bytes,
+                gpu.pci_bus_id
+            );
         }
     }
 
