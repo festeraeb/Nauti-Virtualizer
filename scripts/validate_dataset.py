@@ -58,7 +58,15 @@ FORBIDDEN_HOST_MARKERS = [
 ]
 
 # Catches accidental copy-paste of "secret"/"password" content.
-SECRET_MARKER_RE = re.compile(r"\b(secret|password|api[_-]?key|token)\b", re.IGNORECASE)
+# Security-meaningful only. Bare words like “token” (argv token, lexer token) or
+# “secret” (a secret ingredient) are not flagged; only the credential-shaped forms.
+SECRET_MARKER_PATTERNS = [
+    re.compile(r"\bapi[_-]?key\b", re.IGNORECASE),
+    re.compile(r"\b(auth|access|bearer|refresh|id|client|secret)[_-]?token\b", re.IGNORECASE),
+    re.compile(r"\b(password|passwd|pwd)\s*[=:]", re.IGNORECASE),
+    re.compile(r"\b(secret|credential)s?\s*[=:]", re.IGNORECASE),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),  # AWS access key id shape
+]
 
 # Identifier-shaped token; used by the soft grounding-presence check.
 IDENT_RE = re.compile(r"\b[a-z][a-z0-9_]{2,}\b")
@@ -132,7 +140,7 @@ def check_record(idx: int, rec: dict) -> list[str]:
             errors.append(
                 f"record {idx}: assistant content contains forbidden host marker {marker!r}"
             )
-    if SECRET_MARKER_RE.search(assistant_content):
+    if any(pattern.search(assistant_content) for pattern in SECRET_MARKER_PATTERNS):
         errors.append(
             f"record {idx}: assistant content references a secret/password/token keyword"
         )
