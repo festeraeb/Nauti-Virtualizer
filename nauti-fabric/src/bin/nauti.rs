@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use nauti_fabric::rpc::{AgentClient, RpcRequest, RpcResponse};
 use nauti_fabric::{Fabric, LocalProofAdapter, LocalResourceAdapter, NetworkResourceAdapter, Resource, ResourceAdapter, ResourceKind, ResourceState};
 
 #[derive(serde::Serialize)]
@@ -48,6 +49,16 @@ enum Command {
     },
     /// Run the complete single-host resource lifecycle proof.
     Demo,
+    /// Serve the fabric agent RPC protocol over authenticated Iroh/QUIC.
+    AgentServe {
+        #[arg(long, default_value = "local")]
+        node: String,
+    },
+    /// Connect to a remote fabric agent and run the two-process lease/attach/release proof.
+    AgentConnect {
+        /// JSON-encoded `EndpointAddr` printed by `agent-serve`.
+        addr: String,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -56,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Adapters { json } => adapters(json),
         Command::Inventory { json, node } => inventory(&node, json),
         Command::Demo => demo(),
+        Command::AgentServe { node } => agent_serve(&node),
+        Command::AgentConnect { addr } => agent_connect(&addr),
     }
 }
 
@@ -141,4 +154,81 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
     fabric.release(&lease)?;
     println!("lease={} attachment={} released=true", attachment.lease_id, attachment.adapter);
     Ok(())
+}
+
+/// Starts a fabric agent process: registers local host inventory plus a
+/// demo exclusive GPU resource, then serves the RPC protocol over Iroh/QUIC
+/// until Ctrl-C. Prints the JSON-encoded `EndpointAddr` a controller process
+/// needs to connect (`nauti agent-connect <addr>`).
+fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(async move {
+        let fabric = Arc::new(Fabric::default());
+        fabric.discover_local(node);
+        fabric.register(Resource {
+            id: "gpu.virtual.0".into(),
+            kind: ResourceKind::Gpu,
+            capacity: 1,
+            unit: "device".into(),
+            node: node.into(),
+            state: ResourceState::Available,
+            exclusive: true,
+            attributes: BTreeMap::from([("adapter".into(), "proof".into())]),
+        });
+        fabric.register_adapter(Arc::new(LocalProofAdapter));
+
+        let (router, addr) = nauti_fabric::rpc::serve(fabric).await?;
+        println!("nauti agent listening; endpoint address (paste into agent-connect):");
+        println!("{}", serde_json::to_string(&addr)?);
+        println!("press ctrl-c to stop");
+
+        tokio::signal::ctrl_c().await?;
+        router.shutdown().await.map_err(|error| format!("router shutdown failed: {error}"))?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+/// Connects to a remote fabric agent and runs the two-process lease/attach/
+/// release proof against it end-to-end over authenticated Iroh/QUIC.
+fn agent_connect(addr_json: &str) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+    let addr: iroh::EndpointAddr = serde_json::from_str(addr_json)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(async move {
+        let mut client = AgentClient::connect(addr).await.map_err(|error| error.to_string())?;
+
+        let pong = client.call(RpcRequest::Ping).await.map_err(|error| error.to_string())?;
+        println!("ping -> {pong:?}");
+
+        let inventory = client.call(RpcRequest::Inventory).await.map_err(|error| error.to_string())?;
+        println!("inventory -> {inventory:?}");
+
+        let lease_response = client
+            .call(RpcRequest::LeaseExclusive {
+                resource_id: "gpu.virtual.0".into(),
+                owner: "agent-connect-proof".into(),
+                ttl_secs: 30,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let lease = match lease_response {
+            RpcResponse::Leased(lease) => lease,
+            other => return Err(format!("expected Leased response, got {other:?}").into()),
+        };
+        println!("lease-exclusive -> {lease:?}");
+
+        let attach_response = client
+            .call(RpcRequest::Attach { adapter: "local-proof".into(), lease: lease.clone() })
+            .await
+            .map_err(|error| error.to_string())?;
+        println!("attach -> {attach_response:?}");
+
+        let release_response =
+            client.call(RpcRequest::Release(lease)).await.map_err(|error| error.to_string())?;
+        println!("release -> {release_response:?}");
+
+        client.close().await.map_err(|error| error.to_string())?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
 }

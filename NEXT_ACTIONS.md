@@ -1,6 +1,6 @@
 # Next Actions
 
-1. Add a local agent RPC contract and authenticated Iroh/QUIC two-process proof.
+1. ~~Add a local agent RPC contract and authenticated Iroh/QUIC two-process proof.~~ **DONE** — see `nauti-fabric/src/rpc.rs` (RPC contract: Ping/Inventory/FindAvailable/LeaseExclusive/Attach/Release over length-prefixed JSON framing on Iroh/QUIC, ALPN `nauti-fabric/rpc/1`) and `nauti agent-serve` / `nauti agent-connect` CLI commands in `nauti-fabric/src/bin/nauti.rs`. Verified with a real two-OS-process run: server printed its `EndpointAddr`, client connected over the public internet relay/QUIC and successfully exercised Ping -> Inventory -> LeaseExclusive -> Attach -> Release against the live `Fabric`. Authentication is provided by Iroh's QUIC/TLS endpoint identity (no extra auth layer needed). `cargo test -p nauti-fabric` still passes (10/10).
 2. Add an adapter capability/health report and lease renewal/expiry tests.
 3. Evaluate `hwlocality` for NUMA/PCI capture, gated behind a native dependency feature.
 4. Add `nvml-wrapper` behind an NVIDIA feature and test it only on a suitable host.

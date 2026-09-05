@@ -1,6 +1,7 @@
 //! Foundational resource model and local, exclusive lease proof of concept.
 
 pub mod adapters;
+pub mod rpc;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
