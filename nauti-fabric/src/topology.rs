@@ -52,9 +52,16 @@ impl NumaTopology {
     pub fn discover() -> Result<Self, TopologyError> {
         let topology = Topology::new().map_err(|e| TopologyError::Load(e.to_string()))?;
 
-        let pci_devices: Vec<PciDeviceReport> = topology
-            .objects_with_type(ObjectType::PCIDevice)
-            .map(|obj| PciDeviceReport {
+        // For each PCI device, find its "local" NUMA node(s) by walking up the ancestor chain
+        // until we find an object that carries a nodeset (PCI/IO objects don't have one of
+        // their own; hwloc attaches nodesets to normal/Memory objects). The first bit set in
+        // that nodeset is the NUMA node os_index this device is closest to. If no ancestor
+        // carries a nodeset (e.g. a UMA system with no NUMA nodes at all), the device is left
+        // unassigned here and picked up by the "no NUMA nodes" fallback below.
+        let mut pci_by_node_index: BTreeMap<usize, Vec<PciDeviceReport>> = BTreeMap::new();
+        let mut unassigned_pci_devices: Vec<PciDeviceReport> = Vec::new();
+        for obj in topology.objects_with_type(ObjectType::PCIDevice) {
+            let report = PciDeviceReport {
                 name: obj
                     .name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -65,37 +72,56 @@ impl NumaTopology {
                 device_id: obj
                     .info("PCIDevice")
                     .map(|v| v.to_string_lossy().into_owned()),
-            })
-            .collect();
+            };
 
-        let nodes = topology
+            let local_node_index = std::iter::once(obj)
+                .chain(obj.ancestors())
+                .find_map(|ancestor| ancestor.nodeset())
+                .and_then(|nodeset| nodeset.first_set())
+                .map(|index| usize::from(index));
+
+            match local_node_index {
+                Some(index) => pci_by_node_index.entry(index).or_default().push(report),
+                None => unassigned_pci_devices.push(report),
+            }
+        }
+
+        let mut nodes = topology
             .objects_with_type(ObjectType::NUMANode)
-            .map(|obj| NumaNodeReport {
-                os_index: obj.os_index().map(|i| i as usize).unwrap_or_default(),
-                local_memory_bytes: obj.total_memory(),
-                logical_cpus: obj
-                    .cpuset()
-                    .map(|set| set.weight().unwrap_or(0) as usize)
-                    .unwrap_or(0),
-                // Attributing specific PCI devices to specific NUMA nodes requires walking
-                // ancestor chains; kept flat (all devices reported once, on node 0) for this
-                // first pass to avoid over-engineering ahead of a real consumer.
-                pci_devices: Vec::new(),
+            .map(|obj| {
+                let os_index = obj.os_index().map(|i| i as usize).unwrap_or_default();
+                NumaNodeReport {
+                    os_index,
+                    local_memory_bytes: obj.total_memory(),
+                    logical_cpus: obj
+                        .cpuset()
+                        .map(|set| set.weight().unwrap_or(0) as usize)
+                        .unwrap_or(0),
+                    pci_devices: pci_by_node_index.remove(&os_index).unwrap_or_default(),
+                }
             })
             .collect::<Vec<_>>();
 
-        let mut nodes = nodes;
-        if let Some(first) = nodes.first_mut() {
-            first.pci_devices = pci_devices;
-        } else if !pci_devices.is_empty() {
-            // No NUMA nodes reported (e.g. single-node/UMA system) but PCI devices exist:
-            // synthesize a single implicit node so the PCI facts aren't dropped.
-            nodes.push(NumaNodeReport {
-                os_index: 0,
-                local_memory_bytes: 0,
-                logical_cpus: 0,
-                pci_devices,
-            });
+        // Any PCI devices whose ancestor-walk didn't land on a node we actually enumerated
+        // (nodeset math referenced an os_index we don't have a NUMANode object for) still get
+        // reported, attached to the first known node so the facts aren't silently dropped.
+        for (_, mut leftover) in pci_by_node_index {
+            unassigned_pci_devices.append(&mut leftover);
+        }
+
+        if !unassigned_pci_devices.is_empty() {
+            if let Some(first) = nodes.first_mut() {
+                first.pci_devices.append(&mut unassigned_pci_devices);
+            } else {
+                // No NUMA nodes reported at all (e.g. single-node/UMA system) but PCI devices
+                // exist: synthesize a single implicit node so the PCI facts aren't dropped.
+                nodes.push(NumaNodeReport {
+                    os_index: 0,
+                    local_memory_bytes: 0,
+                    logical_cpus: 0,
+                    pci_devices: unassigned_pci_devices,
+                });
+            }
         }
 
         Ok(Self { nodes })
@@ -149,5 +175,22 @@ mod tests {
             assert_eq!(resource.node, "local");
             assert!(resource.attributes.contains_key("numa.os_index"));
         }
+    }
+
+    #[test]
+    fn pci_devices_are_distributed_across_numa_nodes_not_dropped() {
+        // Sanity check for the ancestor-walk PCI attribution: every PCI device hwloc reports
+        // must end up attached to exactly one NUMA node's report (none silently dropped),
+        // whether or not this host actually has PCI devices or multiple NUMA nodes.
+        let topology = NumaTopology::discover().expect("hwloc topology should load");
+        let attributed_pci_count: usize =
+            topology.nodes().iter().map(|node| node.pci_devices.len()).sum();
+
+        let direct_pci_count = hwlocality::Topology::new()
+            .expect("hwloc topology should load")
+            .objects_with_type(hwlocality::object::types::ObjectType::PCIDevice)
+            .count();
+
+        assert_eq!(attributed_pci_count, direct_pci_count);
     }
 }
