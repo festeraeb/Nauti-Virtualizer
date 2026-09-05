@@ -4,7 +4,13 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use nauti_fabric::rpc::{AgentClient, RpcRequest, RpcResponse};
+#[cfg(feature = "cloud-hypervisor")]
+use nauti_fabric::vmm::{CloudHypervisorAdapter, VmResourceSpec};
+#[cfg(feature = "cloud-hypervisor")]
+use std::path::PathBuf;
 use nauti_fabric::{Fabric, LocalProofAdapter, LocalResourceAdapter, NetworkResourceAdapter, Resource, ResourceKind, ResourceState};
+#[cfg(feature = "cloud-hypervisor")]
+use nauti_fabric::ResourceAdapter;
 
 #[derive(serde::Serialize)]
 struct ToolInfo {
@@ -67,6 +73,58 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Manage local VMs through the Cloud Hypervisor adapter (requires the
+    /// `cloud-hypervisor` build feature and the `cloud-hypervisor` + `ch-remote`
+    /// binaries on PATH).
+    #[cfg(feature = "cloud-hypervisor")]
+    Vm {
+        #[command(subcommand)]
+        action: VmAction,
+    },
+}
+
+#[cfg(feature = "cloud-hypervisor")]
+#[derive(Subcommand)]
+enum VmAction {
+    /// Print the capability/health report of the cloud-hypervisor adapter.
+    Capability,
+    /// Lease a device-resource (the trigger for a VM) and attach it, which
+    /// boots a Cloud Hypervisor VM with the requested virtio-blk layout.
+    /// Idempotent: a second launch for the same resource id is a no-op.
+    Launch {
+        /// Stable id for the VM resource (e.g. `vm.demo.0`).
+        #[arg(long)]
+        resource_id: String,
+        /// Absolute path to the `cloud-hypervisor` binary.
+        #[arg(long)]
+        binary: PathBuf,
+        /// Path to the API socket the VM will listen on.
+        #[arg(long)]
+        api_socket: PathBuf,
+        /// Path to the kernel image.
+        #[arg(long)]
+        kernel: PathBuf,
+        /// Path to the rootfs image.
+        #[arg(long)]
+        rootfs: PathBuf,
+        /// Optional VM name (defaults to the resource id).
+        #[arg(long)]
+        vm_name: Option<String>,
+        /// vCPU count (default 1).
+        #[arg(long, default_value = "1")]
+        vcpus: String,
+        /// Memory in MiB (default 512).
+        #[arg(long, default_value = "512")]
+        memory_mib: String,
+        /// Optional second virtio-blk disk (leased virtio/vhost-user device).
+        #[arg(long)]
+        virtio_blk: Option<PathBuf>,
+        /// Lease TTL in seconds (default 30).
+        #[arg(long, default_value = "30")]
+        ttl_secs: u64,
+    },
+    /// Tear down every VM this process has launched via the adapter.
+    Reconcile,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -81,6 +139,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Topology { json } => topology(json),
         #[cfg(feature = "nvidia")]
         Command::Gpus { json } => gpus(json),
+        #[cfg(feature = "cloud-hypervisor")]
+        Command::Vm { action } => match action {
+            VmAction::Capability => vm_capability(),
+            VmAction::Launch {
+                resource_id,
+                binary,
+                api_socket,
+                kernel,
+                rootfs,
+                vm_name,
+                vcpus,
+                memory_mib,
+                virtio_blk,
+                ttl_secs,
+            } => vm_launch(VmLaunchArgs {
+                resource_id,
+                binary,
+                api_socket,
+                kernel,
+                rootfs,
+                vm_name,
+                vcpus,
+                memory_mib,
+                virtio_blk,
+                ttl_secs,
+            }),
+            VmAction::Reconcile => vm_reconcile(),
+        },
     }
 }
 
@@ -292,4 +378,100 @@ fn agent_connect(addr_json: &str) -> Result<(), Box<dyn std::error::Error>> {
         client.close().await.map_err(|error| error.to_string())?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })
+}
+// ---------------------------------------------------------------------------
+// Cloud Hypervisor CLI (feature-gated)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "cloud-hypervisor")]
+struct VmLaunchArgs {
+    resource_id: String,
+    binary: PathBuf,
+    api_socket: PathBuf,
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    vm_name: Option<String>,
+    vcpus: String,
+    memory_mib: String,
+    virtio_blk: Option<PathBuf>,
+    ttl_secs: u64,
+}
+
+#[cfg(feature = "cloud-hypervisor")]
+fn vm_capability() -> Result<(), Box<dyn std::error::Error>> {
+    // Probe the default binary path; the operator can override via the
+    // `CH_BINARY` env var or by setting `--binary` on the `launch` subcommand.
+    let default = std::env::var("CH_BINARY")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/usr/bin/cloud-hypervisor"));
+    let adapter = CloudHypervisorAdapter::new(default);
+    let report = adapter.capability_report();
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if !report.healthy {
+        eprintln!(
+            "warning: cloud-hypervisor adapter is unhealthy; \
+             `nauti vm launch` will fail until the binary is reachable"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cloud-hypervisor")]
+fn vm_launch(args: VmLaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let VmLaunchArgs {
+        resource_id,
+        binary,
+        api_socket,
+        kernel,
+        rootfs,
+        vm_name,
+        vcpus,
+        memory_mib,
+        virtio_blk,
+        ttl_secs,
+    } = args;
+    let spec = VmResourceSpec {
+        api_socket: api_socket.display().to_string(),
+        kernel: kernel.display().to_string(),
+        rootfs: rootfs.display().to_string(),
+        vm_name,
+        vcpus: Some(vcpus),
+        memory_mib: Some(memory_mib),
+        virtio_blk: virtio_blk.as_ref().map(|path| path.display().to_string()),
+    };
+    let mut attributes = spec.into_attributes();
+    attributes.insert("vmm.binary".into(), binary.display().to_string());
+
+    let fabric = Fabric::default();
+    fabric.register(Resource {
+        id: resource_id.clone(),
+        kind: ResourceKind::Device,
+        capacity: 1,
+        unit: "vm".into(),
+        node: "local".into(),
+        state: ResourceState::Available,
+        exclusive: true,
+        attributes,
+    });
+    let adapter = Arc::new(CloudHypervisorAdapter::new(binary));
+    fabric.register_adapter(Arc::clone(&adapter) as Arc<dyn nauti_fabric::ResourceAdapter>);
+
+    let lease = fabric.lease_exclusive(&resource_id, "nauti-vm", Duration::from_secs(ttl_secs))?;
+    let attachment = fabric.attach("cloud-hypervisor", &lease)?;
+    println!("{}", serde_json::to_string_pretty(&attachment)?);
+    Ok(())
+}
+
+#[cfg(feature = "cloud-hypervisor")]
+fn vm_reconcile() -> Result<(), Box<dyn std::error::Error>> {
+    // Without a live process we cannot recover the adapter's managed-VM
+    // set across invocations; reconcile here is a no-op that prints a hint.
+    // The `nauti` binary's typical use is to launch and reconcile within a
+    // single process, so the adapter is the in-process authority.
+    eprintln!(
+        "nauti vm reconcile is a no-op across processes: run reconcile from \
+         the same process that launched the VM, or use `ch-remote \
+         --api-socket <sock> remove-vm <name>` directly."
+    );
+    Ok(())
 }

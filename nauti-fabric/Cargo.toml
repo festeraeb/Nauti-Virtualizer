@@ -21,3 +21,6 @@ nvml-wrapper = { version = "0.13.0", optional = true }
 [features]
 numa = ["dep:hwlocality"]
 nvidia = ["dep:nvml-wrapper"]
+# Cloud Hypervisor adapter (shells out to the `cloud-hypervisor` / `ch-remote`
+# binaries at runtime; not a build-time link, so this feature has no extra deps).
+cloud-hypervisor = []

@@ -6,6 +6,8 @@ pub mod gpu;
 pub mod rpc;
 #[cfg(feature = "numa")]
 pub mod topology;
+#[cfg(feature = "cloud-hypervisor")]
+pub mod vmm;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -149,6 +151,8 @@ pub enum FabricError {
     },
     #[error("resource does not contain required adapter attribute: {0}")]
     MissingResourceAttribute(String),
+    #[error("adapter {adapter} backend is unavailable: {reason}")]
+    AdapterBackendUnavailable { adapter: String, reason: String },
     #[error("guest memory allocation failed: {0}")]
     GuestMemory(String),
 }
