@@ -1,31 +1,44 @@
-//! Optional NVIDIA GPU capture via `nvml-wrapper` (a safe wrapper around NVIDIA's Management
-//! Library, `libnvidia-ml.so`).
+//! GPU discovery and host-local reservation.
 //!
-//! This module is compiled only when the `nvidia` feature is enabled, since it links against
-//! the native NVML shared library (installed alongside any recent NVIDIA driver). It is kept
-//! separate from `HostInventory::discover` (which has no native dependencies) so that the
-//! default build stays dependency-light; callers opt in explicitly by calling
-//! [`GpuTopology::discover`]. On hosts with no NVIDIA driver/GPU present, `discover` returns a
-//! `GpuError::Load` rather than panicking, so callers can treat "no NVIDIA stack available" as
-//! an ordinary, recoverable condition.
+//! Two discovery paths, one reservation adapter:
+//!
+//! * [`discover`] — the **all-smi adapter**. Always compiled, works on any
+//!   Linux host with DRM nodes. Walks `/sys/class/drm/card*` and identifies
+//!   every GPU by its PCI vendor id: NVIDIA, AMD, Intel, or anything else
+//!   the kernel drives. NVIDIA cards are enriched via NVML when the `nvidia`
+//!   feature is enabled; AMD cards get VRAM from `amdgpu` sysfs. One entry
+//!   per physical GPU, keyed by PCI BDF (stable across reboots), no static
+//!   maps, no scripts.
+//!
+//! * [`GpuTopology`] — the legacy NVML-only path (still available behind the
+//!   `nvidia` feature for callers that want NVIDIA-specific telemetry).
+//!
+//! * [`GpuLocalAdapter`] — the host-local reservation adapter. Consumes the
+//!   [`discover`] result, so it now reflects whatever GPUs are actually
+//!   present rather than a hardcoded test device.
 
-use std::collections::BTreeMap;
+// The legacy NVML-only discovery path. Kept for callers that want
+// NVIDIA-specific telemetry; the all-smi discover module above replaces it
+// for general use. Gated behind `nvidia` because it links NVML.
+#[cfg(feature = "nvidia")]
+mod nvml_legacy {
+    use std::collections::BTreeMap;
 
-use nvml_wrapper::Nvml;
-use serde::{Deserialize, Serialize};
+    use nvml_wrapper::Nvml;
+    use serde::{Deserialize, Serialize};
 
-use crate::{Resource, ResourceKind, ResourceState};
+    use crate::{Resource, ResourceKind, ResourceState};
 
-/// A single NVIDIA GPU discovered via NVML.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct GpuDeviceReport {
-    pub index: u32,
-    pub name: String,
-    pub uuid: String,
-    pub total_memory_bytes: u64,
-    pub free_memory_bytes: u64,
-    pub pci_bus_id: String,
-}
+    /// A single NVIDIA GPU discovered via NVML.
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    pub struct GpuDeviceReport {
+        pub index: u32,
+        pub name: String,
+        pub uuid: String,
+        pub total_memory_bytes: u64,
+        pub free_memory_bytes: u64,
+        pub pci_bus_id: String,
+    }
 
 /// Errors that can occur while probing NVIDIA GPUs.
 #[derive(Debug, thiserror::Error)]
@@ -147,5 +160,18 @@ mod tests {
             assert!(resource.attributes.contains_key("gpu.uuid"));
         }
     }
-}
+} // close mod tests
+} // close nvml_legacy
+
+#[cfg(feature = "nvidia")]
+pub use nvml_legacy::{GpuDeviceReport, GpuError, GpuTopology};
+
+pub mod discover;
 pub mod adapter;
+
+// Re-export the all-smi discovery types at the module root so callers can
+// write `nauti_fabric::gpu::GpuDiscoveryResult` without reaching into the
+// submodule.
+pub use discover::{
+    GpuDevice, GpuDiscoveryError, GpuDiscoveryResult, GpuVendor,
+};

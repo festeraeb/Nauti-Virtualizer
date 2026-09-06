@@ -1,7 +1,6 @@
 //! Foundational resource model and local, exclusive lease proof of concept.
 
 pub mod adapters;
-#[cfg(feature = "nvidia")]
 pub mod gpu;
 pub mod rpc;
 pub mod rpc_auth;
@@ -290,12 +289,24 @@ impl Fabric {
     }
 
     pub fn discover_local(&self, node: impl Into<String>) -> Vec<Resource> {
-        let resources = HostInventory::discover(node);
+        let mut resources = HostInventory::discover(node);
+        // Always discover GPUs via the all-smi adapter (any brand, live).
+        if let Ok(discovery) = crate::gpu::GpuDiscoveryResult::discover() {
+            resources.extend(discovery.as_resources(self.node_for_resources()));
+        }
         for resource in &resources {
             self.register(resource.clone());
         }
         info!(resource_count = resources.len(), "registered local host inventory");
         resources
+    }
+
+    fn node_for_resources(&self) -> String {
+        // Best-effort: use the system hostname so GPU resources are tagged
+        // with the real node name rather than a caller-supplied default.
+        std::env::var("NAUTI_NODE")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .unwrap_or_else(|_| "local".into())
     }
 
     /// Remove a resource from the fabric. Returns `true` if the resource was
@@ -335,37 +346,29 @@ impl Fabric {
     /// [`Self::unregister`]). The returned [`RefreshReport`] lists the ids
     /// added and removed so the operator (or a tool) can audit the change.
     ///
-    /// GPU resources (when the `nvidia` feature is on) are re-discovered
-    /// from NVML on every call so a hot-swapped card appears without an
-    /// agent restart. The contract is "self-discovering": no per-host
-    /// config is required, the next call to `refresh_local` reflects
-    /// whatever the kernel and NVML currently report.
+    /// GPU resources are re-discovered on every call via the all-smi adapter
+    /// ([`crate::gpu::GpuDiscoveryResult`]), which walks `/sys/class/drm` and
+    /// picks up NVIDIA, AMD, Intel, and any other GPU the kernel drives — no
+    /// per-host config, no static maps. A hot-swapped card appears without an
+    /// agent restart. When the `nvidia` feature is enabled, NVIDIA cards are
+    /// additionally enriched with NVML telemetry (real name, UUID, utilization).
     pub fn refresh_local(&self, node: impl Into<String>) -> RefreshReport {
         let node = node.into();
-        // The `mut` is only used under the `nvidia` feature (where we extend
-        // with discovered GPUs). The default build is `mut` but unused;
-        // silence the warning explicitly so the intent is documented.
-        #[allow(unused_mut)]
         let mut new_resources = HostInventory::discover(node.clone());
 
-        // When the nvidia feature is on, also discover GPUs. They share
-        // the local-resource namespace with the host inventory, so a
-        // resource id collision (a hand-registered resource that happens
-        // to have the same id) is resolved in favor of the freshly
-        // discovered one — same precedence as HostInventory::discover.
-        #[cfg(feature = "nvidia")]
-        {
-            match crate::gpu::GpuTopology::discover() {
-                Ok(topology) => {
-                    let gpu_resources = topology.as_resources(node.clone());
-                    info!(count = gpu_resources.len(), "refresh: discovered GPUs");
-                    new_resources.extend(gpu_resources);
-                }
-                Err(error) => {
-                    // Missing driver / no GPUs is an ordinary condition;
-                    // log at info and continue with the host inventory.
-                    info!(?error, "refresh: no NVML, skipping GPU discovery");
-                }
+        // Always discover GPUs via the all-smi adapter (any brand, live).
+        // This is the self-discovering path: no per-host config, the next
+        // call reflects whatever the kernel currently reports.
+        match crate::gpu::GpuDiscoveryResult::discover() {
+            Ok(discovery) => {
+                let gpu_resources = discovery.as_resources(node.clone());
+                info!(count = gpu_resources.len(), "refresh: discovered GPUs (all-smi)");
+                new_resources.extend(gpu_resources);
+            }
+            Err(error) => {
+                // Missing /sys/class/drm is unusual but not fatal; log and
+                // continue with the host inventory.
+                info!(?error, "refresh: GPU discovery unavailable, skipping");
             }
         }
 

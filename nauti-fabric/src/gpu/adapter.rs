@@ -151,6 +151,11 @@ impl ResourceAdapter for GpuLocalAdapter {
 
     fn capability_report(&self) -> AdapterReport {
         let reservation_count = self.reservations.lock().map(|m| m.len()).unwrap_or(0);
+        // Live GPU count from the all-smi adapter — reflects whatever the
+        // kernel currently reports, not a static config.
+        let gpu_count = crate::gpu::GpuDiscoveryResult::discover()
+            .map(|d| d.devices.iter().filter(|g| !g.display_only).count())
+            .unwrap_or(0);
         AdapterReport {
             name: self.name().into(),
             scope: SCOPE.into(),
@@ -161,6 +166,7 @@ impl ResourceAdapter for GpuLocalAdapter {
                     "gpu.attachment_mode".to_string(),
                     "host-local reservation (no hardware binding)".into(),
                 ),
+                ("gpu.count_live".to_string(), gpu_count.to_string()),
                 ("reservations.current".to_string(), reservation_count.to_string()),
                 (
                     "vfio.available".to_string(),

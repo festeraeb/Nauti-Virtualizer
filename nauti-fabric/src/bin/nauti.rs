@@ -73,12 +73,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Probe local NVIDIA GPUs via NVML (requires the `nvidia` build feature).
-    #[cfg(feature = "nvidia")]
+    /// Probe local GPUs via the all-smi adapter (any brand: NVIDIA, AMD,
+    /// Intel, anything the kernel drives through `/sys/class/drm`). Works
+    /// without the `nvidia` build feature. NVIDIA cards are enriched with
+    /// NVML telemetry when the `nvidia` feature is enabled.
     Gpus {
         /// Emit the GPU report as JSON.
         #[arg(long)]
         json: bool,
+        /// Group devices by vendor (NVIDIA / AMD / Intel / ...) and list
+        /// individuals within each group.
+        #[arg(long)]
+        grouped: bool,
+        /// Show only one vendor group (e.g. `--type amd`). Case-insensitive.
+        #[arg(long)]
+        type_: Option<String>,
     },
     /// Manage local VMs through the Cloud Hypervisor adapter (requires the
     /// `cloud-hypervisor` build feature and the `cloud-hypervisor` + `ch-remote`
@@ -144,8 +153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::AgentConnect { addr } => agent_connect(&addr),
         #[cfg(feature = "numa")]
         Command::Topology { json } => topology(json),
-        #[cfg(feature = "nvidia")]
-        Command::Gpus { json } => gpus(json),
+        Command::Gpus { json, grouped, type_ } => gpus(json, grouped, type_),
         #[cfg(feature = "cloud-hypervisor")]
         Command::Vm { action } => match action {
             VmAction::Capability => vm_capability(),
@@ -243,28 +251,74 @@ fn topology(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(feature = "nvidia")]
-fn gpus(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let topology = nauti_fabric::gpu::GpuTopology::discover()?;
+fn gpus(json: bool, grouped: bool, type_filter: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let discovery = nauti_fabric::gpu::GpuDiscoveryResult::discover()?;
+
+    // Apply the optional vendor filter (--type amd|nvidia|intel|...).
+    let filter = type_filter.as_deref().map(str::to_lowercase);
 
     if json {
-        println!("{}", serde_json::to_string_pretty(topology.devices())?);
-    } else {
-        println!("INDEX\tNAME\tUUID\tTOTAL_BYTES\tFREE_BYTES\tPCI_BUS_ID");
-        for gpu in topology.devices() {
-            println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
-                gpu.index,
-                gpu.name,
-                gpu.uuid,
-                gpu.total_memory_bytes,
-                gpu.free_memory_bytes,
-                gpu.pci_bus_id
-            );
+        if grouped {
+            println!("{}", serde_json::to_string_pretty(&discovery.grouped())?);
+        } else {
+            println!("{}", serde_json::to_string_pretty(&discovery.devices)?);
         }
+        return Ok(());
     }
 
+    if grouped {
+        let groups = discovery.grouped();
+        for (vendor, devices) in &groups {
+            if filter.as_deref().map_or(false, |f| !vendor.to_lowercase().contains(f)) {
+                continue;
+            }
+            if vendor == "__display_only__" {
+                continue; // hide BMC VGA controllers unless explicitly asked
+            }
+            println!("=== {} ({} devices) ===", vendor, devices.len());
+            for gpu in devices {
+                print_gpu(gpu);
+            }
+        }
+        return Ok(());
+    }
+
+    // Flat list, optional vendor filter.
+    for gpu in &discovery.devices {
+        if gpu.display_only {
+            continue;
+        }
+        if filter.as_deref().map_or(false, |f| !gpu.vendor.label().to_lowercase().contains(f)) {
+            continue;
+        }
+        print_gpu(gpu);
+    }
     Ok(())
+}
+
+fn print_gpu(gpu: &nauti_fabric::gpu::GpuDevice) {
+    let uuid = gpu.uuid.as_deref().unwrap_or("-");
+    let util = gpu
+        .utilization_pct
+        .map(|u| format!("{}%", u))
+        .unwrap_or_else(|| "-".into());
+    let _temp = gpu
+        .temperature_c
+        .map(|t| format!("{t}°C"))
+        .unwrap_or_else(|| "-".into());
+    let vram_mb = gpu.vram_total_bytes / (1024 * 1024);
+    let flag = if gpu.display_only { " [display-only]" } else { "" };
+    println!(
+        "{}\t{}\t{}\t{}MB\t{}\t{}\t{}{}",
+        gpu.vendor.label(),
+        gpu.device_name,
+        uuid,
+        vram_mb,
+        gpu.driver,
+        gpu.pci_bdf,
+        util,
+        flag,
+    );
 }
 
 fn inventory(node: &str, json: bool, refresh: bool) -> Result<(), Box<dyn std::error::Error>> {
