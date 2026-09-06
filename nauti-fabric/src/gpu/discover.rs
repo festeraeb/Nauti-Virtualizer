@@ -253,6 +253,7 @@ impl GpuDiscoveryResult {
     }
 }
 
+#[allow(dead_code)] // consumed by the nvidia-enrichment path; dead in pure all-smi builds
 fn normalize_bdf(raw: &str) -> String {
     let trimmed = raw.trim().to_lowercase();
     if trimmed.is_empty() { return String::new(); }

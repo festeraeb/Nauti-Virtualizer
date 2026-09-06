@@ -150,13 +150,17 @@ pub struct CloudHypervisorConfig {
     pub memory_mib: u32,
 }
 
+#[allow(dead_code)] // reserved: wired into vm launch default resolution (follow-up)
 fn default_ch_binary() -> PathBuf {
     PathBuf::from("/usr/bin/cloud-hypervisor")
 }
+#[allow(dead_code)] // serde default fn; referenced by attribute string, invisible to dead-code analysis
 fn default_ch_socket_dir() -> PathBuf {
     PathBuf::from("/var/run/nauti")
 }
+#[allow(dead_code)] // serde default fn; referenced by attribute string, invisible to dead-code analysis
 fn default_vcpus() -> u32 { 1 }
+#[allow(dead_code)] // serde default fn; referenced by attribute string, invisible to dead-code analysis
 fn default_memory_mib() -> u32 { 512 }
 
 /// Errors from config loading.

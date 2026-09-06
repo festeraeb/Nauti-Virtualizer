@@ -145,6 +145,63 @@ impl Launcher for ProcessLauncher {
     }
 }
 
+/// Provisions the host-side networking a VM's `vmm.net` spec refers to —
+/// today, the tap device named in `tap=<name>,...`. Kept behind a trait for
+/// the same reason as [`Launcher`]: tap/bridge creation needs root or
+/// CAP_NET_ADMIN, so tests inject a mock and never touch the host.
+pub trait NetProvisioner: Send + Sync {
+    fn provision(&self, attrs: &std::collections::BTreeMap<String, String>) -> Result<(), String>;
+}
+
+/// Real provisioning: creates the tap (`ip tuntap add dev <tap> mode tap`)
+/// and brings it up (`ip link set <tap> up`) unless it already exists.
+/// Failures surface verbatim — the honesty rule applies to networking too.
+#[derive(Clone, Debug, Default)]
+pub struct ProcessNetProvisioner;
+
+impl NetProvisioner for ProcessNetProvisioner {
+    fn provision(&self, attrs: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+        use std::process::Command;
+        let net = attrs
+            .get("vmm.net")
+            .ok_or_else(|| "vmm.net attribute missing".to_string())?;
+        let tap = net
+            .split(',')
+            .find_map(|kv| kv.strip_prefix("tap="))
+            .ok_or_else(|| format!("vmm.net spec has no tap= key: {net}"))?
+            .trim()
+            .to_string();
+        // Idempotent: a tap that already exists (possibly from a previous
+        // lease or set up by the operator) is fine as-is.
+        if let Ok(out) = Command::new("ip").args(["link", "show", &tap]).output() {
+            if out.status.success() {
+                return Ok(());
+            }
+        }
+        let add = Command::new("ip")
+            .args(["tuntap", "add", "dev", &tap, "mode", "tap"])
+            .output()
+            .map_err(|error| format!("failed to run `ip tuntap add`: {error}"))?;
+        if !add.status.success() {
+            return Err(format!(
+                "ip tuntap add dev {tap} mode tap failed (needs root/CAP_NET_ADMIN?): {}",
+                String::from_utf8_lossy(&add.stderr).trim()
+            ));
+        }
+        let up = Command::new("ip")
+            .args(["link", "set", &tap, "up"])
+            .output()
+            .map_err(|error| format!("failed to run `ip link set`: {error}"))?;
+        if !up.status.success() {
+            return Err(format!(
+                "ip link set {tap} up failed: {}",
+                String::from_utf8_lossy(&up.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The internal record of a VM this adapter has launched, so a second
 /// `attach` for the same resource+lease is a no-op and `reconcile` knows
 /// what to remove.
@@ -163,6 +220,7 @@ struct ManagedVm {
 pub struct CloudHypervisorAdapter<L: Launcher> {
     binary: PathBuf,
     launcher: Arc<L>,
+    net: Arc<dyn NetProvisioner>,
     managed: Mutex<HashMap<String, ManagedVm>>,
 }
 
@@ -190,9 +248,20 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
     /// Build an adapter with a custom [`Launcher`]. Used by tests to inject a
     /// recording mock; the production constructor is [`Self::new`].
     pub fn with_launcher(binary: PathBuf, launcher: Arc<L>) -> Self {
+        Self::with_launcher_and_net(binary, launcher, Arc::new(ProcessNetProvisioner))
+    }
+
+    /// Build an adapter with a custom [`Launcher`] **and** [`NetProvisioner`].
+    /// Tests inject both mocks; production uses [`Self::new`].
+    pub fn with_launcher_and_net(
+        binary: PathBuf,
+        launcher: Arc<L>,
+        net: Arc<dyn NetProvisioner>,
+    ) -> Self {
         Self {
             binary,
             launcher,
+            net,
             managed: Mutex::new(HashMap::new()),
         }
     }
@@ -238,6 +307,27 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
         if let Some(extra_disk) = attrs.get("vmm.virtio_blk") {
             argv.push("--disk".into());
             argv.push(format!("path={extra_disk}"));
+        }
+        // VFIO device passthrough: `vmm.device` holds one or more comma-
+        // separated sysfs paths (e.g. the IOMMU group device backing a leased
+        // GPU). Each becomes a Cloud Hypervisor `--device path=...` flag. This
+        // is the join between a VFIO GPU lease and the VM that drives it.
+        if let Some(devices) = attrs.get("vmm.device") {
+            for device in devices.split(',') {
+                let device = device.trim();
+                if !device.is_empty() {
+                    argv.push("--device".into());
+                    argv.push(format!("path={device}"));
+                }
+            }
+        }
+        // Virtio-net: `vmm.net` is a Cloud Hypervisor net spec, e.g.
+        // `tap=nauti0,mac=52:54:00:12:34:56`. The host-side tap named in the
+        // spec is provisioned by the adapter's NetProvisioner at attach time,
+        // before the VM launches (so a missing tap fails synchronously).
+        if let Some(net) = attrs.get("vmm.net") {
+            argv.push("--net".into());
+            argv.push(net.clone());
         }
         Ok(argv)
     }
@@ -334,6 +424,18 @@ impl<L: Launcher + 'static> ResourceAdapter for CloudHypervisorAdapter<L> {
             });
         }
 
+        // Provision host-side networking (the tap named in `vmm.net`) before
+        // the VM launches: a missing tap must fail the attach synchronously,
+        // never leave a booted-but-unreachable guest behind.
+        if resource.attributes.contains_key("vmm.net") {
+            self.net
+                .provision(&resource.attributes)
+                .map_err(|reason| FabricError::AdapterBackendUnavailable {
+                    adapter: self.name().into(),
+                    reason,
+                })?;
+        }
+
         let argv = self.build_argv(resource)?;
         self.launcher
             .launch_vm(&binary, &argv)
@@ -409,7 +511,28 @@ fn detail_map(
 }
 
 #[cfg(test)]
-mod tests {
+mod net_tests {
+    use super::*;
+
+    /// Records provision() calls without touching the host.
+    struct MockNet {
+        fail: bool,
+        calls: Mutex<Vec<String>>,
+    }
+    impl NetProvisioner for MockNet {
+        fn provision(&self, attrs: &std::collections::BTreeMap<String, String>) -> Result<(), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(attrs.get("vmm.net").cloned().unwrap_or_default());
+            if self.fail {
+                Err("tap0: bridge br-fabric missing".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     use super::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -672,6 +795,75 @@ mod tests {
         // appear in the argv (identity lives in the resource id + socket).
         assert!(!joined.contains("--name"));
         assert!(!joined.contains("--boot"));
+    }
+
+    #[test]
+    fn attach_provisions_net_before_launch_and_argv_carries_it() {
+        let launcher = Arc::new(MockLauncher::new(true));
+        let net = Arc::new(MockNet { fail: false, calls: Mutex::new(Vec::new()) });
+        let adapter = CloudHypervisorAdapter::with_launcher_and_net(
+            PathBuf::from("/mock/cloud-hypervisor"),
+            Arc::clone(&launcher),
+            Arc::clone(&net) as Arc<dyn NetProvisioner>,
+        );
+        let mut resource = device_resource("vm.net0");
+        resource
+            .attributes
+            .insert("vmm.net".into(), "tap=nauti0,mac=52:54:00:12:34:56".into());
+
+        adapter.attach(&resource, &lease("vm.net0")).unwrap();
+
+        // The tap named in the spec was provisioned exactly once, before
+        // the VM spawn.
+        assert_eq!(net.calls.lock().unwrap().len(), 1);
+        assert_eq!(net.calls.lock().unwrap()[0], "tap=nauti0,mac=52:54:00:12:34:56");
+        let joined = launcher.launches()[0].1.join(" ");
+        assert!(joined.contains("--net tap=nauti0,mac=52:54:00:12:34:56"));
+    }
+
+    #[test]
+    fn attach_fails_synchronously_when_net_provisioning_fails() {
+        let launcher = Arc::new(MockLauncher::new(true));
+        let adapter = CloudHypervisorAdapter::with_launcher_and_net(
+            PathBuf::from("/mock/cloud-hypervisor"),
+            Arc::clone(&launcher),
+            Arc::new(MockNet { fail: true, calls: Mutex::new(Vec::new()) }) as Arc<dyn NetProvisioner>,
+        );
+        let mut resource = device_resource("vm.net1");
+        resource
+            .attributes
+            .insert("vmm.net".into(), "tap=missing0".into());
+
+        let err = adapter.attach(&resource, &lease("vm.net1")).unwrap_err();
+
+        // No VM may boot into a broken network: fail before spawn, with a
+        // typed backend-unavailable error carrying the provisioner reason.
+        match err {
+            FabricError::AdapterBackendUnavailable { adapter, reason } => {
+                assert_eq!(adapter, "cloud-hypervisor");
+                assert!(reason.contains("br-fabric missing"), "reason: {reason}");
+            }
+            other => panic!("expected AdapterBackendUnavailable, got {other:?}"),
+        }
+        assert!(launcher.launches().is_empty(), "VM must not launch");
+    }
+
+    #[test]
+    fn build_argv_emits_one_device_flag_per_vfio_path() {
+        let launcher = Arc::new(MockLauncher::new(true));
+        let adapter = CloudHypervisorAdapter::with_launcher(
+            PathBuf::from("/mock/cloud-hypervisor"),
+            launcher,
+        );
+        let mut resource = device_resource("vm.gpu0");
+        resource
+            .attributes
+            .insert("vmm.device".into(), "/sys/bus/pci/devices/0000:d8:00.0, /sys/bus/pci/devices/0000:d8:00.1".into());
+
+        let joined = adapter.build_argv(&resource).unwrap().join(" ");
+
+        assert!(joined.contains("--device path=/sys/bus/pci/devices/0000:d8:00.0"));
+        assert!(joined.contains("--device path=/sys/bus/pci/devices/0000:d8:00.1"));
     }
 }
 
