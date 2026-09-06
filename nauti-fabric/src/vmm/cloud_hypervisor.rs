@@ -58,7 +58,8 @@ pub trait Launcher: Send + Sync {
     fn locate_binary(&self, configured_path: &Path) -> Option<PathBuf>;
 
     /// Spawn a VM. Returns `Ok(())` if the process exits 0 within the wait
-    /// window, or an error otherwise. The `argv` is the exact argument list
+    /// horizon (or, for detached launchers, if the process started cleanly);
+    /// `Err(reason)` otherwise. The `argv` is the exact argument list
     /// the adapter chose; tests can assert on its contents.
     fn launch_vm(&self, binary: &Path, argv: &[String]) -> Result<(), String>;
 
@@ -94,18 +95,35 @@ impl Launcher for ProcessLauncher {
     }
 
     fn launch_vm(&self, binary: &Path, argv: &[String]) -> Result<(), String> {
-        use std::process::Command;
-        let status = Command::new(binary)
+        use std::process::{Command, Stdio};
+        // VMs are long-lived: spawn detached and return immediately rather
+        // than blocking on the guest's exit. Dropping the Child handle does
+        // not kill the process; teardown goes through `remove_vm`/reconcile.
+        // (A VM that exits after this function returns is reaped when the
+        // launching process exits; long-lived agents should call `reconcile`.)
+        let mut child = Command::new(binary)
             .args(argv)
-            .status()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
             .map_err(|error| format!("failed to spawn {}: {error}", binary.display()))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "{} exited with status {status}",
+        // Give the VMM a moment to fail fast (bad flags, KVM perms) so the
+        // caller sees a synchronous error instead of a silently dead VM.
+        // `try_wait` also reaps the child if it did exit.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        match child.try_wait() {
+            Ok(Some(status)) => Err(format!(
+                "{} exited immediately with status {status}; \
+                 check kernel/rootfs paths and /dev/kvm access",
                 binary.display()
-            ))
+            )),
+            Ok(None) => {
+                let _ = child.id(); // still running
+                drop(child);
+                Ok(())
+            }
+            Err(error) => Err(format!("failed to poll {} after spawn: {error}", binary.display())),
         }
     }
 
@@ -188,10 +206,6 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
         let api_socket = require_attr(attrs, "vmm.api_socket")?;
         let kernel = require_attr(attrs, "vmm.kernel")?;
         let rootfs = require_attr(attrs, "vmm.rootfs")?;
-        let vm_name = attrs
-            .get("vmm.vm_name")
-            .cloned()
-            .unwrap_or_else(|| resource.id.clone());
         let vcpus = attrs
             .get("vmm.vcpus")
             .cloned()
@@ -203,11 +217,13 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
 
         let mut argv: Vec<String> = vec![
             "--api-socket".into(),
-            format!("socket={api_socket}"),
+            format!("path={api_socket}"),
             "--cpus".into(),
             format!("boot={vcpus}"),
             "--memory".into(),
-            format!("size={memory_mib}"),
+            // CH's `size=` key takes bytes or a suffixed value; the adapter
+            // contract (vmm.memory_mib) is MiB, so append the M suffix.
+            format!("size={memory_mib}M"),
             "--kernel".into(),
             kernel,
             "--disk".into(),
@@ -216,10 +232,8 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
             "tty".into(),
             "--console".into(),
             "off".into(),
-            "--boot".into(),
-            "kernel".into(),
-            "--name".into(),
-            vm_name,
+            // Cloud Hypervisor v53+ does not accept a --name flag; the VM
+            // identity is carried in the resource id + api_socket path.
         ];
         if let Some(extra_disk) = attrs.get("vmm.virtio_blk") {
             argv.push("--disk".into());
@@ -648,13 +662,16 @@ mod tests {
         resource.attributes.insert("vmm.virtio_blk".into(), "/tmp/extra.raw".into());
         let argv = adapter.build_argv(&resource).unwrap();
         let joined = argv.join(" ");
-        assert!(joined.contains("--api-socket socket=/tmp/nauti-test-vm.0.sock"));
+        assert!(joined.contains("--api-socket path=/tmp/nauti-test-vm.0.sock"));
         assert!(joined.contains("--cpus boot=4"));
-        assert!(joined.contains("--memory size=2048"));
+        assert!(joined.contains("--memory size=2048M"));
         assert!(joined.contains("--kernel /tmp/kernel"));
         assert!(joined.contains("--disk path=/tmp/rootfs"));
         assert!(joined.contains("--disk path=/tmp/extra.raw"));
-        assert!(joined.contains("--name vm.0"));
+        // Cloud Hypervisor v53+ has no --name flag; the VM name must not
+        // appear in the argv (identity lives in the resource id + socket).
+        assert!(!joined.contains("--name"));
+        assert!(!joined.contains("--boot"));
     }
 }
 

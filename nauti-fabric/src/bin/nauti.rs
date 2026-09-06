@@ -441,9 +441,11 @@ struct VmLaunchArgs {
 fn vm_capability() -> Result<(), Box<dyn std::error::Error>> {
     // Probe the default binary path; the operator can override via the
     // `CH_BINARY` env var or by setting `--binary` on the `launch` subcommand.
-    let default = std::env::var("CH_BINARY")
+        let default = std::env::var("CH_BINARY")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/usr/bin/cloud-hypervisor"));
+        .unwrap_or_else(|_| which::which("cloud-hypervisor").unwrap_or_else(|_| {
+            PathBuf::from("/usr/bin/cloud-hypervisor")
+        }));
     let adapter = CloudHypervisorAdapter::new(default);
     let report = adapter.capability_report();
     println!("{}", serde_json::to_string_pretty(&report)?);
