@@ -21,3 +21,8 @@ Cloud Hypervisor, rust-vmm, vhost-device, Iroh/QUIC, VFIO, and hardware-specific
 The eventual Strand LoRA adapter creator should be constrained by the adapter contract and must produce tests for lease, capability, health, failure, and cleanup behavior. It should generate thin integrations around upstream components, never duplicate a VMM or transport stack.
 
 A LoRA fine-tuning corpus and its curation rules are maintained in a separate fine-tuning repository (not bundled with this crate). A plug-in validation tool for anyone curating a corpus in the same shape lives in `tools/dataset-validate/`; it is built on demand with `cargo run -p dataset-validate -- <path-to-corpus.jsonl>` and is **not** a build or test-time dependency of the deployable crate.
+
+## Relationship to nauti-nodes
+
+[nauti-nodes](https://github.com/festeraeb/nauti-nodes) is the real-fleet node registry that can sit on top of this fabric. Its per-host SSH polling and this fabric's agent RPC are designed to coexist; the onboarding path (consumer → lease-aware actor → full VM/serving peer) and the stability contract it can build against are in [NAUTI_NODES_ONBOARDING.md](NAUTI_NODES_ONBOARDING.md).
+
