@@ -1,5 +1,17 @@
 # Onboarding path: nauti-nodes onto the Nauti fabric
 
+> **Layering note (three projects, one stack):**
+>
+> - **nauti-inferer** — the inference *engine* (GPU serve, kernels, model load
+>   path; extracted from `core/cesarops-inference`). Runs *on* resources.
+> - **Nauti-Virtualizer** (this repo) — the *substrate*: discovery (all-smi),
+>   leases, VMs/VFIO, serving adapters (Lemonade). Provides resources.
+> - **nauti-nodes** — the *control plane* (job federation, worker
+>   register/heartbeat, OpenAI-compatible API). Schedules *across* resources
+>   by consuming this fabric only. It never talks to the engine's GPU path
+>   directly, and the engine never implements leases — each layer talks only
+>   to its neighbor.
+
 `nauti-nodes` is a real-fleet node registry (SSH-live polling of cesarops2/3/4/t440)
 built before this fabric existed. Today its fleet view is live, but its node
 identities and inventory are gathered per-host out-of-band. This fabric can
@@ -7,6 +19,10 @@ become that node's substrate, so every host it polls is also a leaseable,
 virtualizable, serving-ready resource — without replacing nauti-nodes.
 
 ## The gap today (what nauti-nodes can't do)
+
+These map 1:1 to nauti-nodes' own documented limitations (synthetic worker
+telemetry, hard-coded fallback GPU list, affinity-score node picking, no
+identity proof):
 
 | nauti-nodes has | This fabric adds |
 |---|---|
