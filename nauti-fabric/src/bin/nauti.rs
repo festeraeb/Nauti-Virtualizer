@@ -209,6 +209,14 @@ fn adapters(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     fabric.register_adapter(Arc::new(LocalProofAdapter));
     fabric.register_adapter(Arc::new(LocalResourceAdapter));
     fabric.register_adapter(Arc::new(NetworkResourceAdapter));
+    let lemonade = nauti_fabric::LemonadeAdapter::new(nauti_fabric::LemonadeConfig {
+        host: std::env::var("LEMONADE_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+        port: std::env::var("LEMONADE_PORT")
+            .map(|p| p.parse().unwrap_or(13305))
+            .unwrap_or(13305),
+        api_key: std::env::var("LEMONADE_API_KEY").ok(),
+    });
+    fabric.register_adapter(Arc::new(lemonade));
     let reports = fabric.adapter_reports();
 
     if json {

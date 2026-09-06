@@ -1,17 +1,26 @@
-//! All-brand GPU discovery via Linux DRM sysfs (\047/sys/class/drm\047).
+//! All-brand GPU discovery via Linux DRM sysfs (`/sys/class/drm`).
 //!
-//! This is the "all-smi" adapter: it walks every DRM node the kernel exposes
-//! and identifies the GPU by its PCI vendor/device id \u{2014} no vendor-specific
-//! management library required. NVIDIA, AMD, Intel, and anything else the
-//! kernel drives through \047/sys/class/drm/card*\047 shows up here.
+//! **`all-smi` is the authority.** This adapter walks every DRM node the
+//! kernel exposes and identifies the GPU by its PCI vendor/device id — no
+//! vendor-specific management library is *required*. NVIDIA, AMD, Intel, and
+//! anything else the kernel drives through `/sys/class/drm/card*` always
+//! show up here.
 //!
-//! NVIDIA cards are enriched with NVML data (real name, UUID, memory,
-//! utilization, temperature) when the \047nvidia\047 feature is enabled; AMD
-//! cards get their VRAM from the amdgpu sysfs file \047mem_info_vram_total\047.
-//! One entry per physical GPU, no duplicates, no static maps, no scripts.
+//! `nvidia-smi` (via the `nvml-wrapper` Rust library) is **optional
+//! enrichment only** — it is compiled behind the `nvidia` feature and adds
+//! NVIDIA-specific telemetry (UUID, real model name, utilization, temp) that
+//! DRM does not expose. It is NEVER the source of truth, and AMD / Intel /
+//! any-brand cards are discovered and reported identically without it.
 //!
-//! Identity is the PCI BDF (\0470000:03:00.0\047): stable across reboots, so a
-//! hot-swap reads as "old card gone, new card appeared."
+//! VRAM for AMD comes from the `amdgpu` sysfs file `mem_info_vram_total`
+//! (present whenever amdgpu binds the card); NVIDIA cards get it from NVML
+//! when available, else they report 0 MB and rely on the enumeration. The
+//! result is one entry per physical GPU with the best data available for its
+//! brand — no duplicates, no static maps, no scripts.
+//!
+//! Identity is the PCI BDF (`0000:03:00.0`): stable across reboots and unique
+//! per slot, so a hot-swap is detected as "old card gone, new card appeared"
+//! rather than "the same card changed."
 
 use std::collections::BTreeMap;
 use std::fs;

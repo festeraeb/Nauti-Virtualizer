@@ -21,7 +21,7 @@ use thiserror::Error;
 use tracing::info;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
-pub use adapters::{LocalResourceAdapter, NetworkResourceAdapter};
+pub use adapters::{LemonadeAdapter, LemonadeConfig, LocalResourceAdapter, NetworkResourceAdapter};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum ResourceKind {
