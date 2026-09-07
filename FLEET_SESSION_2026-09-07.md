@@ -9,7 +9,7 @@ next integration steps.
 | Node | Role | State |
 |---|---|---|
 | t440 | policy core: resident **Ornith-35B** (2×P100 :5200), paddler :8080, fleet-hq | stable |
-| c2 | inference (P100) | **crash-looping** — excluded until fixed (see below) |
+| c2 | inference (P100) | **stable after iommu=pt fix** — re-enlisted |
 | c4 | inference (3×GPU + WX 5100 via lemond :13306) | stable after PEF fix |
 
 ## c4 incident (resolved) — hidden fan + PEF
@@ -21,7 +21,7 @@ all 16 PEF policies (`ipmitool pef`); keep PEF off until a real fan is
 reinstalled. Lesson: "every-N-minutes reset that survives everything OS-level
 ⇒ check BMC PEF policies first."
 
-## c2 incident (open) — driver double-DMA → MCE
+## c2 incident (resolved) — driver double-DMA → MCE
 
 NVIDIA driver 580.173.02 double-mapped DMA pages through the Intel IOMMU
 (`DMAR: DMA PTE for vPFN already set`) → Bank 0x13 uncorrectable MCE → NMI
