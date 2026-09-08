@@ -61,6 +61,12 @@ pub enum RpcRequest {
     Attach { adapter: String, lease: Lease },
     /// Release a previously granted lease.
     Release(Lease),
+    /// Extend a previously granted lease by `ttl_secs` from now (the
+    /// resource-holder's renewal beat for long-held resources).
+    LeaseRenew { lease: Lease, ttl_secs: u64 },
+    /// Liveness heartbeat from a node; refreshes its staleness clock so it
+    /// is not evicted by stale-node sweeps.
+    Heartbeat { node: String },
 }
 
 /// Responses returned for each [`RpcRequest`] variant.
@@ -178,6 +184,13 @@ fn dispatch(fabric: &Fabric, request: RpcRequest) -> RpcResponse {
         }
         RpcRequest::Attach { adapter, lease } => RpcResponse::from(fabric.attach(&adapter, &lease)),
         RpcRequest::Release(lease) => RpcResponse::from(fabric.release(&lease)),
+        RpcRequest::LeaseRenew { lease, ttl_secs } => {
+            RpcResponse::from(fabric.renew_lease(&lease, Duration::from_secs(ttl_secs)))
+        }
+        RpcRequest::Heartbeat { node } => {
+            fabric.heartbeat(&node);
+            RpcResponse::Pong
+        }
     }
 }
 

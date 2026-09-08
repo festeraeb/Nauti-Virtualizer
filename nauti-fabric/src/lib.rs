@@ -277,6 +277,7 @@ pub struct Fabric {
     resources: RwLock<HashMap<String, Resource>>,
     leases: Mutex<HashMap<String, ActiveLease>>,
     adapters: RwLock<HashMap<String, Arc<dyn ResourceAdapter>>>,
+    heartbeats: Mutex<HashMap<String, Instant>>,
     next_lease_id: AtomicU64,
 }
 
@@ -565,6 +566,58 @@ impl Fabric {
             _ => Err(FabricError::LeaseNotFound),
         }
     }
+
+    /// Records a liveness heartbeat from `node`. Nodes that stop sending
+    /// heartbeats eventually become eligible for eviction by
+    /// [`Fabric::evict_stale_nodes`].
+    pub fn heartbeat(&self, node: &str) {
+        self.heartbeats
+            .lock()
+            .expect("heartbeat registry lock poisoned")
+            .insert(node.to_string(), Instant::now());
+    }
+
+    /// Evicts every node whose last heartbeat is older than `older_than`.
+    /// Eviction removes the node's heartbeat entry **and** unregisters the
+    /// resources it owns — except resources under an active lease, which the
+    /// fabric never silently orphans (they are left for the lease's TTL to
+    /// prune). Returns the ids of the evicted nodes.
+    pub fn evict_stale_nodes(&self, older_than: Duration) -> Vec<String> {
+        let cutoff = Instant::now() - older_than;
+        let stale: Vec<String> = {
+            let mut heartbeats = self
+                .heartbeats
+                .lock()
+                .expect("heartbeat registry lock poisoned");
+            let stale: Vec<String> = heartbeats
+                .iter()
+                .filter(|(_, seen)| **seen < cutoff)
+                .map(|(node, _)| node.clone())
+                .collect();
+            for node in &stale {
+                heartbeats.remove(node);
+            }
+            stale
+        };
+        if stale.is_empty() {
+            return stale;
+        }
+        let owned: Vec<String> = self
+            .resources
+            .read()
+            .expect("resource registry lock poisoned")
+            .iter()
+            .filter(|(_, resource)| stale.contains(&resource.node))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &owned {
+            // Resources under an active lease are deliberately rejected here;
+            // the lease's own expiry is what reclaims them.
+            let _ = self.unregister(id);
+        }
+        info!(nodes = ?stale, resources = owned.len(), "evicted stale nodes");
+        stale
+    }
 }
 
 /// Allocates guest-addressable RAM using rust-vmm's `vm-memory` implementation.
@@ -789,6 +842,66 @@ mod tests {
             fabric.renew_lease(&bogus, Duration::from_secs(30)),
             Err(FabricError::LeaseNotFound)
         );
+    }
+
+    #[test]
+    fn heartbeat_keeps_a_node_fresh_and_eviction_reaps_only_the_stale() {
+        let fabric = Fabric::default();
+        fabric.heartbeat("cesarops2");
+        fabric.heartbeat("cesarops4");
+
+        // Both nodes just heartbeat — nothing is stale yet.
+        assert!(fabric.evict_stale_nodes(Duration::from_secs(60)).is_empty());
+
+        // A fresh beat from one node cannot save the other past the window.
+        std::thread::sleep(Duration::from_millis(20));
+        fabric.heartbeat("cesarops4");
+        assert_eq!(
+            fabric.evict_stale_nodes(Duration::from_millis(10)),
+            vec!["cesarops2".to_string()]
+        );
+    }
+
+    #[test]
+    fn evicting_a_stale_node_unregisters_its_resources_but_never_orphans_a_lease() {
+        let fabric = Fabric::default();
+        fabric.heartbeat("ghost-node");
+        fabric.register(Resource {
+            id: "gpu.ghost.0".into(),
+            kind: ResourceKind::Gpu,
+            capacity: 1,
+            unit: "device".into(),
+            node: "ghost-node".into(),
+            state: ResourceState::Available,
+            exclusive: true,
+            attributes: BTreeMap::new(),
+        });
+        fabric.register(Resource {
+            id: "gpu.ghost.1".into(),
+            kind: ResourceKind::Gpu,
+            capacity: 1,
+            unit: "device".into(),
+            node: "ghost-node".into(),
+            state: ResourceState::Available,
+            exclusive: true,
+            attributes: BTreeMap::new(),
+        });
+
+        // Lease one of the ghost's resources, then let the node go stale.
+        let _lease = fabric
+            .lease_exclusive("gpu.ghost.0", "mission-a", Duration::from_secs(300))
+            .expect("lease should succeed");
+        std::thread::sleep(Duration::from_millis(15));
+
+        assert_eq!(
+            fabric.evict_stale_nodes(Duration::from_millis(10)),
+            vec!["ghost-node".to_string()]
+        );
+        let remaining: Vec<String> =
+            fabric.resources().iter().map(|r| r.id.clone()).collect();
+        // Leased resource survives (lease TTL reclaims it); free one is gone.
+        assert!(remaining.contains(&"gpu.ghost.0".to_string()));
+        assert!(!remaining.contains(&"gpu.ghost.1".to_string()));
     }
 
     #[test]
