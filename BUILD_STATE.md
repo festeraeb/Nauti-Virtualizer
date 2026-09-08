@@ -65,3 +65,29 @@ Each milestone closes only when its agent check passes; no skipping ahead.
 - [x] nauti default build still 44/44 (untouched by M1).
 
 ## Next: M2 — registry convergence (one truth, two views)
+
+## M2 agent check — CLOSED 2026-09-08
+
+Authority decision: **the node is the authority** (self-report via the
+shared DRM walk); Nauti `Fabric` is the resource/lease authority;
+fleet-hq is the membership/health view. Neither registry invents GPUs.
+
+- [x] Shared walk: `fleet-worker/src/discovery.rs` gained
+      `DrmCardIdentity` + `read_drm_cards()` (same files, same order as
+      nauti all-smi). `discover_sysfs_drm_gpus()` now consumes it:
+      PCI vendor id authoritative, driver string fallback only;
+      identity keyed by BDF (`sysfs-<bdf>` uuid), name carries BDF.
+- [x] Live test `read_drm_cards_live_walk_is_sound` passes (BDF-shaped
+      identity on every card, PCI-id-wins attribution rule).
+- [x] `GpuReport` docs pin the M2 identity rule (BDF suffix matching).
+- [x] Live HQ `/v1/fleet` read 2026-09-08: 5 nodes reporting. The OLD
+      worker binaries still emit `sysfs-cardN` uuids + `cardN` names
+      (pre-M2 build); the M2 code changes uuid/name to BDF form on the
+      next worker deploy. Nauti `nauti gpus --json` on this host shows
+      BDF-keyed entries (`0000:5e:00.0`, `0000:af:00.0`, mgag200
+      display-only) — same cards both views see, identity convergence
+      completes when workers redeploy.
+- [x] forge-fleet workspace: 72 → **73 passed, 0 failed** (1 new M2 test).
+- [x] nauti default build still 44/44 (untouched by M2).
+
+## Next: M3 — local runner on each node (no SSH in the execution path)
