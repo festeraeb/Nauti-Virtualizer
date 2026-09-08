@@ -119,6 +119,8 @@ impl GpuDiscoveryResult {
         }
 
         let nvml_by_bdf = Self::nvml_by_bdf();
+        #[cfg(feature = "rocm")]
+        let rocm_map = super::rocm::collect(Path::new("/sys"), Path::new("/sys/class/drm"));
         let mut devices: Vec<GpuDevice> = Vec::with_capacity(entries.len());
         for (_card_idx, mut dev) in entries {
             if matches!(dev.vendor, GpuVendor::Nvidia) {
@@ -130,6 +132,34 @@ impl GpuDiscoveryResult {
                     dev.vram_used_bytes = nvml.4;
                     dev.utilization_pct = nvml.5;
                     dev.temperature_c = nvml.6;
+                }
+            }
+            #[cfg(feature = "rocm")]
+            if matches!(dev.vendor, GpuVendor::Amd) && !dev.display_only {
+                // AMD enrichment mirrors the NVML path: rocm-smi preferred,
+                // amdgpu sysfs/hwmon always available as the fallback.
+                let telemetry = rocm_map.get(&dev.pci_bdf);
+                if let Some(t) = telemetry {
+                    if let Some(name) = &t.product_name {
+                        if !name.is_empty() {
+                            dev.device_name = name.clone();
+                        }
+                    }
+                    if t.unique_id.is_some() {
+                        dev.uuid = t.unique_id.clone();
+                    }
+                    if let Some(v) = t.vram_total_bytes {
+                        if v > 0 { dev.vram_total_bytes = v; }
+                    }
+                    if let Some(v) = t.vram_used_bytes {
+                        dev.vram_used_bytes = v;
+                    }
+                    if t.utilization_pct.is_some() {
+                        dev.utilization_pct = t.utilization_pct;
+                    }
+                    if t.temperature_c.is_some() {
+                        dev.temperature_c = t.temperature_c;
+                    }
                 }
             }
             devices.push(dev);

@@ -204,6 +204,10 @@ pub struct LemonadeReport {
     pub version: Option<String>,
     /// Models Lemonade reports as downloaded/loadable, one per backend.
     pub models: Vec<LemonadeModel>,
+    /// AMD compute GPUs present on this host (all-smi discovery), so a
+    /// Lemonade deployment can be tied to its Vulkan-capable hardware.
+    /// Display-only BMC VGA is excluded. Empty on NVIDIA-only hosts.
+    pub amd_gpus: Vec<String>,
 }
 
 /// A model Lemonade can serve, tied to a backend (the compute path Lemonade
@@ -238,8 +242,18 @@ impl LemonadeAdapter {
     /// Missing/unsuccessful CLI calls are folded into `reachable: false`
     /// rather than panicking.
     pub fn status(&self) -> LemonadeReport {
-        let mut report = LemonadeReport::default();
+        let mut report = LemonadeReport { amd_gpus: Vec::new(), ..Default::default() };
         let base = format!("{}:{}", self.config.host, self.config.port);
+
+        // AMD Vulkan-capable hardware on this host — all-smi is the
+        // authority, this just surfaces it next to the Lemonade capability.
+        if let Ok(discovery) = crate::gpu::discover::GpuDiscoveryResult::discover() {
+            report.amd_gpus = discovery.devices.iter()
+                .filter(|d| matches!(d.vendor, crate::gpu::discover::GpuVendor::Amd)
+                    && !d.display_only)
+                .map(|d| format!("{} ({})", d.device_name, d.pci_bdf))
+                .collect();
+        }
 
         // `lemonade status` — server liveness + version.
         if let Some(out) = run_lemonade("status", &base, self.config.api_key.as_deref()) {
@@ -398,10 +412,12 @@ mod lemonade_tests {
                 downloaded: true,
                 size_gb: Some(0.36),
             }],
+            amd_gpus: vec!["AMD GPU (0000:3b:00.0)".into()],
         };
         assert!(report.reachable);
         assert_eq!(report.version.as_deref(), Some("11.9.0"));
         assert_eq!(report.models.len(), 1);
+        assert_eq!(report.amd_gpus.len(), 1);
     }
 
     #[test]

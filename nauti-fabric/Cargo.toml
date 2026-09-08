@@ -35,6 +35,7 @@ cloud-hypervisor = []
 auth-ttl = []
 auth-oauth = []
 auth-shared-secret = []
+rocm = []
 # Self-discovering VFIO GPU passthrough adapter. Pure-Rust ioctl wrappers
 # via `vfio-ioctls`; the adapter re-discovers at every attach and falls back
 # to a host-local reservation if the host has no IOMMU / no vfio-pci bind.

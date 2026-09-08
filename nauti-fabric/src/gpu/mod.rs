@@ -168,6 +168,8 @@ pub use nvml_legacy::{GpuDeviceReport, GpuError, GpuTopology};
 
 pub mod discover;
 pub mod adapter;
+#[cfg(feature = "rocm")]
+pub mod rocm;
 
 // Re-export the all-smi discovery types at the module root so callers can
 // write `nauti_fabric::gpu::GpuDiscoveryResult` without reaching into the
