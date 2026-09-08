@@ -51,3 +51,17 @@ Each milestone closes only when its agent check passes; no skipping ahead.
   untracked (local runtime artifact + unreviewed report, not M0 scope).
 
 ## Next: M1 — node contract + rRCP job schema (protocol first, code second)
+
+## M1 agent check — CLOSED 2026-09-08
+
+- [x] `RRCP_CONTRACT.md` — canonical §§1–4 + reject catalogue + §5 mapping
+      table (no renames), referenced by both repos (no copies).
+- [x] `fleet-protocol/src/message.rs` — `RrcpAdvertise/Job/Result` types +
+      `validate_rrcp()` + `RRCP_REJECTS` catalogue.
+- [x] `fleet-protocol/tests/rrcp_contract.rs` — golden triple validates
+      clean; 4 malformed variants (unknown-schema, missing-field,
+      unknown-op, lease-expired) reject with exact §4 tokens. 5/5 pass.
+- [x] forge-fleet workspace: 67 → **72 passed, 0 failed** (5 new rrcp tests).
+- [x] nauti default build still 44/44 (untouched by M1).
+
+## Next: M2 — registry convergence (one truth, two views)
