@@ -8,7 +8,7 @@ use nauti_fabric::rpc::{AgentClient, RpcRequest, RpcResponse};
 use nauti_fabric::vmm::{CloudHypervisorAdapter, VmResourceSpec};
 #[cfg(feature = "cloud-hypervisor")]
 use std::path::PathBuf;
-use nauti_fabric::{Fabric, LocalProofAdapter, LocalResourceAdapter, NetworkResourceAdapter, Resource, ResourceKind, ResourceState};
+use nauti_fabric::{Fabric, Lease, LocalProofAdapter, LocalResourceAdapter, NetworkResourceAdapter, Resource, ResourceKind, ResourceRequest, ResourceState};
 #[cfg(feature = "cloud-hypervisor")]
 use nauti_fabric::ResourceAdapter;
 
@@ -65,6 +65,14 @@ enum Command {
     AgentConnect {
         /// JSON-encoded `EndpointAddr` printed by `agent-serve`.
         addr: String,
+    },
+    /// Drive a remote fabric agent over the RPC contract — the verbs an
+    /// LLM-facing tool layer (MCP) calls. `addr` is the JSON-encoded
+    /// `EndpointAddr` the agent printed at startup and self-registered to
+    /// its address file (default /var/lib/nauti/<node>-addr.json).
+    Fabric {
+        #[command(subcommand)]
+        action: FabricAction,
     },
     /// Probe local NUMA/PCI topology via hwloc (requires the `numa` build feature).
     #[cfg(feature = "numa")]
@@ -156,6 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Demo => demo(),
         Command::AgentServe { node } => agent_serve(&node),
         Command::AgentConnect { addr } => agent_connect(&addr),
+        Command::Fabric { action } => fabric_action(action),
         #[cfg(feature = "numa")]
         Command::Topology { json } => topology(json),
         Command::Gpus { json, grouped, type_ } => gpus(json, grouped, type_),
@@ -437,6 +446,10 @@ fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (router, addr) = nauti_fabric::rpc::serve(fabric).await?;
         println!("nauti agent listening; endpoint address (paste into agent-connect):");
         println!("{}", serde_json::to_string(&addr)?);
+        match persist_addr(&node, &addr) {
+            Ok(path) => println!("self-registered address file: {path}"),
+            Err(error) => println!("warning: could not persist address file: {error}"),
+        }
         println!("press ctrl-c to stop");
 
         tokio::signal::ctrl_c().await?;
@@ -588,4 +601,207 @@ fn vm_reconcile() -> Result<(), Box<dyn std::error::Error>> {
          --api-socket <sock> remove-vm <name>` directly."
     );
     Ok(())
+}
+// ---------------------------------------------------------------------------
+// Fabric RPC verbs (M5: the LLM-facing tool layer calls these)
+// ---------------------------------------------------------------------------
+
+#[derive(Subcommand)]
+enum FabricAction {
+    /// Liveness probe: Ping round-trip. Non-zero exit when unreachable.
+    Ping { addr: String },
+    /// List every resource registered with the remote fabric, as JSON.
+    Inventory { addr: String },
+    /// Query the remote fabric for available resources matching the request.
+    Find {
+        addr: String,
+        /// Resource kind filter (cpu, gpu, memory, storage, network, device).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Minimum capacity in the resource's own unit.
+        #[arg(long)]
+        min_capacity: Option<u64>,
+        /// Restrict to one node name.
+        #[arg(long)]
+        node: Option<String>,
+        /// Required attribute, `key=value`; repeatable.
+        #[arg(long = "attr")]
+        attrs: Vec<String>,
+        /// Only exclusive-capable resources.
+        #[arg(long)]
+        exclusive: bool,
+    },
+    /// Take an exclusive, time-bounded lease on one resource; prints the
+    /// lease as JSON (feed it back to `fabric release`).
+    Lease {
+        addr: String,
+        #[arg(long)]
+        resource_id: String,
+        #[arg(long, default_value = "mcp-tools")]
+        owner: String,
+        #[arg(long, default_value_t = 300)]
+        ttl_secs: u64,
+    },
+    /// Release a lease (pass the lease JSON printed by `fabric lease`).
+    Release {
+        addr: String,
+        /// The lease JSON printed by `fabric lease`.
+        #[arg(long = "lease-json")]
+        lease_json: String,
+    },
+}
+
+/// Runs one fabric verb against a remote agent over authenticated Iroh/QUIC.
+/// Every failure path returns a typed, printable error — the tool layer
+/// surfaces these verbatim, so unreachable agents degrade instead of panicking.
+fn fabric_action(action: FabricAction) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(async {
+        let addr: String = match &action {
+            FabricAction::Ping { addr }
+            | FabricAction::Inventory { addr }
+            | FabricAction::Find { addr, .. }
+            | FabricAction::Lease { addr, .. }
+            | FabricAction::Release { addr, .. } => addr.clone(),
+        };
+        let addr: iroh::EndpointAddr = serde_json::from_str(&addr)
+            .map_err(|error| format!("--addr is not a JSON EndpointAddr: {error}"))?;
+        let mut client = AgentClient::connect(addr)
+            .await
+            .map_err(|error| format!("agent unreachable: {error}"))?;
+        let result: Result<String, String> = async {
+            match action {
+                FabricAction::Ping { .. } => client
+                    .call(RpcRequest::Ping)
+                    .await
+                    .map(|pong| format!("pong -> {pong:?}"))
+                    .map_err(|error| error.to_string()),
+                FabricAction::Inventory { .. } => {
+                    let response = client.call(RpcRequest::Inventory).await.map_err(|e| e.to_string())?;
+                    match response {
+                        RpcResponse::Inventory(resources) => serde_json::to_string_pretty(&resources)
+                            .map_err(|e| e.to_string()),
+                        other => Err(format!("expected Inventory response, got {other:?}")),
+                    }
+                }
+                FabricAction::Find { kind, min_capacity, node, attrs, exclusive, .. } => {
+                    let mut required_attributes = BTreeMap::new();
+                    for attr in attrs {
+                        let (key, value) = attr
+                            .split_once('=')
+                            .ok_or_else(|| format!("--attr expects key=value, got {attr:?}"))?;
+                        required_attributes.insert(key.to_string(), value.to_string());
+                    }
+                    let kind = match kind.as_deref() {
+                        None => None,
+                        Some(raw) => Some(match raw.to_ascii_lowercase().as_str() {
+                            "cpu" => ResourceKind::Cpu,
+                            "gpu" => ResourceKind::Gpu,
+                            "memory" => ResourceKind::Memory,
+                            "storage" => ResourceKind::Storage,
+                            "network" => ResourceKind::Network,
+                            "device" => ResourceKind::Device,
+                            other => return Err(format!("unknown kind {other:?} (cpu|gpu|memory|storage|network|device)")),
+                        }),
+                    };
+                    let request = ResourceRequest {
+                        kind,
+                        minimum_capacity: min_capacity,
+                        node,
+                        required_attributes,
+                        exclusive,
+                    };
+                    let response = client
+                        .call(RpcRequest::FindAvailable(request))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match response {
+                        RpcResponse::FindAvailable(resources) => serde_json::to_string_pretty(&resources)
+                            .map_err(|e| e.to_string()),
+                        other => Err(format!("expected FindAvailable response, got {other:?}")),
+                    }
+                }
+                FabricAction::Lease { resource_id, owner, ttl_secs, .. } => {
+                    let response = client
+                        .call(RpcRequest::LeaseExclusive { resource_id, owner, ttl_secs })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match response {
+                        RpcResponse::Leased(lease) => serde_json::to_string_pretty(&lease)
+                            .map_err(|e| e.to_string()),
+                        RpcResponse::Error(error) => Err(format!("lease rejected: {}", error.message)),
+                        other => Err(format!("expected Leased response, got {other:?}")),
+                    }
+                }
+                FabricAction::Release { lease_json, .. } => {
+                    let lease: Lease = serde_json::from_str(&lease_json)
+                        .map_err(|error| format!("lease JSON is not a Lease: {error}"))?;
+                    let response = client.call(RpcRequest::Release(lease)).await.map_err(|e| e.to_string())?;
+                    match response {
+                        RpcResponse::Released => Ok("released=true".into()),
+                        RpcResponse::Error(error) => Err(format!("release rejected: {}", error.message)),
+                        other => Err(format!("expected Released response, got {other:?}")),
+                    }
+                }
+            }
+        }
+        .await;
+        client.close().await.map_err(|error| error.to_string())?;
+        println!("{}", result?);
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+/// Default address-file directory for self-registered agents; overridable
+/// with `NAUTI_AGENT_ADDR_DIR` (tests, sandboxed deployments).
+fn addr_file_dir() -> String {
+    std::env::var("NAUTI_AGENT_ADDR_DIR").unwrap_or_else(|_| "/var/lib/nauti".into())
+}
+
+/// The address-file path for a node: `<dir>/<node>-addr.json`.
+fn addr_file_path(node: &str) -> String {
+    format!("{}/{}-addr.json", addr_file_dir().trim_end_matches('/'), node)
+}
+
+/// Persists the agent's `EndpointAddr` so controller processes (the MCP tool
+/// layer) can self-discover the fleet without manual endpoint sync. The node
+/// already knows what it is — it announces where to reach it.
+fn persist_addr(node: &str, addr: &iroh::EndpointAddr) -> Result<String, String> {
+    let json = serde_json::to_string_pretty(addr).map_err(|error| error.to_string())?;
+    persist_addr_json_to(&addr_file_path(node), &json)
+}
+
+fn persist_addr_json_to(path: &str, json: &str) -> Result<String, String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("{}: {error}", parent.display()))?;
+    }
+    std::fs::write(path, json).map_err(|error| format!("{path}: {error}"))?;
+    Ok(path.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persist_addr_json_writes_file_and_creates_parents() {
+        let dir = std::env::temp_dir().join(format!("nauti-addr-test-{}", std::process::id()));
+        let path = dir.join("nested").join("test-node-addr.json");
+        let written = persist_addr_json_to(path.to_str().unwrap(), r#"{"probe":true}"#)
+            .expect("persist");
+        let read = std::fs::read_to_string(&written).expect("read back");
+        assert_eq!(read, r#"{"probe":true}"#);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn addr_file_path_uses_node_name_in_default_dir() {
+        // No env mutation (tests run in parallel); verify the default layout.
+        if std::env::var("NAUTI_AGENT_ADDR_DIR").is_err() {
+            assert_eq!(addr_file_path("t440"), "/var/lib/nauti/t440-addr.json");
+            assert_eq!(addr_file_path("cesarops2"), "/var/lib/nauti/cesarops2-addr.json");
+        }
+    }
 }
