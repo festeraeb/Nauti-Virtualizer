@@ -143,6 +143,32 @@ impl Launcher for ProcessLauncher {
             ))
         }
     }
+
+    /// Liveness, not existence: a socket file left behind by a crashed
+    /// launch is *not* a running VM. Probe the socket with `ch-remote info`;
+    /// if the probe fails (connection refused, stale path, dead VMM), remove
+    /// the socket so the next `attach` can spawn fresh instead of treating
+    /// the wreck as an idempotent no-op.
+    fn vm_is_running(&self, api_socket: &Path) -> bool {
+        use std::process::{Command, Stdio};
+        if !api_socket.exists() {
+            return false;
+        }
+        let live = Command::new("ch-remote")
+            .arg(format!("--api-socket={}", api_socket.display()))
+            .arg("info")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !live {
+            // Stale socket from a failed prior launch — clear the poison.
+            let _ = std::fs::remove_file(api_socket);
+        }
+        live
+    }
 }
 
 /// Provisions the host-side networking a VM's `vmm.net` spec refers to —
@@ -533,7 +559,6 @@ mod net_tests {
         }
     }
 
-    use super::*;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
 
@@ -878,6 +903,9 @@ pub struct VmResourceSpec {
     pub vcpus: Option<String>,
     pub memory_mib: Option<String>,
     pub virtio_blk: Option<String>,
+    /// Cloud Hypervisor net spec (e.g. `tap=tap0,mac=…`). When set, the
+    /// adapter provisions the tap before spawn and passes `--net`.
+    pub net: Option<String>,
 }
 
 impl VmResourceSpec {
@@ -897,6 +925,9 @@ impl VmResourceSpec {
         }
         if let Some(virtio_blk) = self.virtio_blk {
             attrs.insert("vmm.virtio_blk".into(), virtio_blk);
+        }
+        if let Some(net) = self.net {
+            attrs.insert("vmm.net".into(), net);
         }
         attrs
     }

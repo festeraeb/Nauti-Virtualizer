@@ -135,6 +135,11 @@ enum VmAction {
         /// Optional second virtio-blk disk (leased virtio/vhost-user device).
         #[arg(long)]
         virtio_blk: Option<PathBuf>,
+        /// Optional Cloud Hypervisor net spec, e.g. `tap=tap0,mac=de:ad:be:ef:00:01`.
+        /// The named tap is provisioned (`ip tuntap add`, link up) before spawn
+        /// and passed to the VM as `--net`. Requires root/CAP_NET_ADMIN.
+        #[arg(long)]
+        net: Option<String>,
         /// Lease TTL in seconds (default 30).
         #[arg(long, default_value = "30")]
         ttl_secs: u64,
@@ -167,6 +172,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 vcpus,
                 memory_mib,
                 virtio_blk,
+                net,
                 ttl_secs,
             } => vm_launch(VmLaunchArgs {
                 resource_id,
@@ -178,6 +184,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 vcpus,
                 memory_mib,
                 virtio_blk,
+                net,
                 ttl_secs,
             }),
             VmAction::Reconcile => vm_reconcile(),
@@ -496,6 +503,7 @@ struct VmLaunchArgs {
     vcpus: String,
     memory_mib: String,
     virtio_blk: Option<PathBuf>,
+    net: Option<String>,
     ttl_secs: u64,
 }
 
@@ -532,6 +540,7 @@ fn vm_launch(args: VmLaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
         vcpus,
         memory_mib,
         virtio_blk,
+        net,
         ttl_secs,
     } = args;
     let spec = VmResourceSpec {
@@ -542,6 +551,7 @@ fn vm_launch(args: VmLaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
         vcpus: Some(vcpus),
         memory_mib: Some(memory_mib),
         virtio_blk: virtio_blk.as_ref().map(|path| path.display().to_string()),
+        net,
     };
     let mut attributes = spec.into_attributes();
     attributes.insert("vmm.binary".into(), binary.display().to_string());
