@@ -90,7 +90,45 @@ fleet-hq is the membership/health view. Neither registry invents GPUs.
 - [x] forge-fleet workspace: 72 → **73 passed, 0 failed** (1 new M2 test).
 - [x] nauti default build still 44/44 (untouched by M2).
 
-## Next: M3 — local runner on each node (no SSH in the execution path)
+## M3 agent check — CLOSED 2026-09-10
+
+- [x] `fleet-hq/src/commands.rs` — new module: `enqueue_job` / `poll_jobs` /
+      `ack_job` (SQLite-backed rRCP job queue, at-least-once delivery).
+- [x] `fleet-hq/src/api.rs` — three endpoints wired: `POST /v1/commands`
+      (enqueue), `GET /v1/commands/pending?node_id=<uuid>` (poll),
+      `POST /v1/commands/:command_id/ack` (ack).
+- [x] `fleet-hq/src/persistence.rs` — `rrcp_jobs` table migration.
+- [x] forge-fleet workspace: 73 → **73 passed, 0 failed** (M3 was a net-new
+      module, no existing tests broken).
+
+## M4 agent check — CLOSED 2026-09-10
+
+- [x] `nauti vm launch` — live VM booted on t440 via the fabric
+      (`state: "Running"` via `ch-remote info`).
+- [x] Tap networking — `nauti0` provisioned by the fabric's
+      `NetProvisioner`, passed to the VM as `--net tap=nauti0,mac=...`.
+- [x] NAT masquerade — host routes VM traffic to LAN, VM reaches
+      fleet-hq / paddler / MCP tools.
+- [x] Stale-socket liveness fix — `attach()` now checks socket liveness,
+      not just existence (a crashed first launch no longer poisons the
+      second).
+
+## M6 agent check — CLOSED 2026-09-10
+
+- [x] Live attach: VM launched on c2 with P100 passed through via
+      `--device path=/sys/bus/pci/devices/0000:0d:00.0` → state "Running".
+- [x] VM sees device: device tree shows `_vfio1` with the P100's 16GB BAR
+      mapped.
+- [x] Detach: VM shut down, device released from VM.
+- [x] Release: P100 rebound to nvidia driver, visible in nvidia-smi.
+- [x] `iommu=pt` host (c2) passes — no IOMMU group viability issues for
+      single-function groups.
+- [x] Note: RTX 2060 SUPER (0a:00.0) could NOT be passed through — its
+      IOMMU group has 4 functions (GPU + audio + USB + nvidia-gpu) and the
+      nvidia-gpu function doesn't support VFIO. Hardware limitation, not a
+      code issue. P100 (single-function group) works perfectly.
+
+## Next: M7 — vhost-user backend proof
 
 ## M5 agent check — CLOSED 2026-09-10
 
