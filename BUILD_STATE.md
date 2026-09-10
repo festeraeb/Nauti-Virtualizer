@@ -91,3 +91,16 @@ fleet-hq is the membership/health view. Neither registry invents GPUs.
 - [x] nauti default build still 44/44 (untouched by M2).
 
 ## Next: M3 — local runner on each node (no SSH in the execution path)
+
+## M5 agent check — CLOSED 2026-09-10
+
+- [x] `nauti fabric` RPC verbs: ping/inventory/find/lease/release drive the
+      real Iroh/QUIC `RpcRequest` contract; typed errors, no panics.
+- [x] Agent self-registration: `agent-serve` writes its `EndpointAddr` to
+      `/var/lib/nauti/<node>-addr.json` (env-overridable). The MCP layer
+      auto-discovers the fleet by scanning that dir.
+- [x] MCP tools (`server.js`): fabric_inventory / fabric_find /
+      fabric_lease / fabric_release — 9 tools served, syntax OK, auto-discover.
+- [x] Model prep doc `MODEL_PREP.md` committed.
+- [x] LIVE cross-host proof (t440 -> c2 over QUIC): ping=Pong;
+      lease gpu.virtual.0 -> {id:1,…}; release -> released=true.
