@@ -113,7 +113,7 @@ fleet-hq is the membership/health view. Neither registry invents GPUs.
       not just existence (a crashed first launch no longer poisons the
       second).
 
-## M6 agent check — CLOSED 2026-09-10
+## M6 agent check — CLOSED 2026-09-10 (revised 2026-09-10 late)
 
 - [x] Live attach: VM launched on c2 with P100 passed through via
       `--device path=/sys/bus/pci/devices/0000:0d:00.0` → state "Running".
@@ -123,10 +123,34 @@ fleet-hq is the membership/health view. Neither registry invents GPUs.
 - [x] Release: P100 rebound to nvidia driver, visible in nvidia-smi.
 - [x] `iommu=pt` host (c2) passes — no IOMMU group viability issues for
       single-function groups.
-- [x] Note: RTX 2060 SUPER (0a:00.0) could NOT be passed through — its
-      IOMMU group has 4 functions (GPU + audio + USB + nvidia-gpu) and the
-      nvidia-gpu function doesn't support VFIO. Hardware limitation, not a
-      code issue. P100 (single-function group) works perfectly.
+- [x] **REVISED — RTX 2060 SUPER (0a:00.0-3) 4-function passthrough NOW
+      FIXED**. The earlier "hardware limitation" note was wrong. Root cause:
+      the BIOS DMAR table declares RMRR device scopes on the GPU functions
+      (0a:00.1 = audio, 0a:00.2 = USB3, 0a:00.3 = nvidia-gpu), so
+      intel-iommu refuses VFIO domain attach for those functions
+      (`Firmware has requested this device have a 1:1 IOMMU mapping` →
+      `SET_CONTAINER errno 22`). Fix: early-initrd ACPI DMAR override that
+      strips those scopes, PLUS a required `oem_revision` bump (kernel's
+      `acpi_table_initrd_override()` requires `existing->oem_revision <
+      table->oem_revision`, i.e. strictly greater — an iasl-rebuilt table
+      with equal revision is silently skipped).
+      - `ACPI: Table Upgrade: override [DMAR-HP-ProLiant]` at boot
+      - sysfs `/sys/firmware/acpi/tables/DMAR` = 1192 bytes (was 1462)
+      - iommu group 31 `reserved_regions` = `msi` only (no RMRR directs)
+      - `VFIO_GROUP_SET_CONTAINER` on group 31 → **OK** (was EINVAL)
+      - cloud-hypervisor: state `Running`, 4 `_vfio1..4` devices attached
+      - guest (Ubuntu 22.04.5) boots to login and enumerates all 4 GPU
+        functions: `10de:1f06` (TU106), `10de:10f9` (audio),
+        `10de:1ada` (USB3), `10de:1adb` (USB-C).
+- [x] Deployment footprint (c2): `/boot/dmar-override.cpio` (newc cpio,
+      `kernel/firmware/acpi/dmar.aml`, rev 2, checksum valid),
+      `GRUB_EARLY_INITRD_LINUX_CUSTOM="dmar-override.cpio"` in
+      `/etc/default/grub`, boots with `iommu=pt` unchanged.
+- [x] Flood watcher closed: NVRM/probe spam silenced via worker guards
+      (discovery.rs grasps nvidia-smi when all NVIDIA compute devices are
+      vfio-bound) + `/etc/modprobe.d/99-nvidia-silence.conf`
+      (`install nvidia /bin/true` etc.) + persistenced masked. Boot NVRM
+      journal count = 0, no live nvidia-smi/nvidia-modprobe spawns.
 
 ## Next: M7 — vhost-user backend proof
 
