@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 use nauti_fabric::rpc::{AgentClient, RpcRequest, RpcResponse};
 #[cfg(feature = "cloud-hypervisor")]
 use nauti_fabric::vmm::{CloudHypervisorAdapter, VmResourceSpec};
-#[cfg(feature = "cloud-hypervisor")]
+#[cfg(any(feature = "cloud-hypervisor", feature = "vhost-user"))]
 use std::path::PathBuf;
 use nauti_fabric::{Fabric, Lease, LocalProofAdapter, LocalResourceAdapter, NetworkResourceAdapter, Resource, ResourceKind, ResourceRequest, ResourceState};
 #[cfg(feature = "cloud-hypervisor")]
@@ -105,6 +105,61 @@ enum Command {
         #[command(subcommand)]
         action: VmAction,
     },
+    /// Serve vhost-user device backends and wire the remote entropy stub
+    /// (requires the `vhost-user` build feature). The backend socket is
+    /// attached to a VM via `nauti vm launch --user-device ...`.
+    #[cfg(feature = "vhost-user")]
+    Vhost {
+        #[command(subcommand)]
+        action: VhostAction,
+    },
+}
+
+/// M7 vhost-user subcommands. `serve` is the device backend (blocks until
+/// Cloud Hypervisor disconnects); `entropy-serve` and `pump` are the two
+/// halves of the remote entropy stub.
+#[cfg(feature = "vhost-user")]
+#[derive(Subcommand)]
+enum VhostAction {
+    /// Serve a virtio-rng vhost-user backend on `--socket`, blocking until
+    /// the frontend (Cloud Hypervisor) disconnects.
+    Serve {
+        /// Unix socket path for the backend (VM attaches with
+        /// `--user-device socket=<path>`).
+        #[arg(long)]
+        socket: PathBuf,
+        /// Entropy source: `/dev/urandom` (local) or a FIFO fed by
+        /// `nauti vhost pump` (remote stub).
+        #[arg(long, default_value = "/dev/urandom")]
+        source: PathBuf,
+        /// Rate-limit window in ms (QEMU-compatible max 65536).
+        #[arg(long, default_value_t = nauti_fabric::vhost::rng::MAX_PERIOD_MS)]
+        period_ms: u128,
+        /// Max bytes served per period (default unlimited).
+        #[arg(long, default_value_t = usize::MAX)]
+        max_bytes: usize,
+    },
+    /// Run the remote entropy server (the device-host half of the stub).
+    /// Answers length-prefixed TCP requests with bytes from /dev/urandom.
+    EntropyServe {
+        /// Listen address, e.g. `0.0.0.0:7877`.
+        #[arg(long)]
+        listen: String,
+    },
+    /// Pump entropy from a remote `entropy-serve` into a local FIFO the
+    /// RNG backend reads. Runs until the remote peer dies.
+    Pump {
+        /// Remote server address, e.g. `10.55.0.1:7877`.
+        #[arg(long)]
+        connect: String,
+        /// Output path — a FIFO (created if missing) that
+        /// `nauti vhost serve --source <path>` consumes.
+        #[arg(long)]
+        out: PathBuf,
+        /// Bytes per request (default 64 KiB).
+        #[arg(long, default_value_t = nauti_fabric::vhost::entropy::DEFAULT_CHUNK)]
+        chunk: u32,
+    },
 }
 
 #[cfg(feature = "cloud-hypervisor")]
@@ -148,6 +203,10 @@ enum VmAction {
         /// and passed to the VM as `--net`. Requires root/CAP_NET_ADMIN.
         #[arg(long)]
         net: Option<String>,
+        /// Optional vhost-user backend socket to attach at boot via
+        /// `--user-device socket=...` (M7; serve one with `nauti vhost serve`).
+        #[arg(long)]
+        user_device: Option<PathBuf>,
         /// Lease TTL in seconds (default 30).
         #[arg(long, default_value = "30")]
         ttl_secs: u64,
@@ -182,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 memory_mib,
                 virtio_blk,
                 net,
+                user_device,
                 ttl_secs,
             } => vm_launch(VmLaunchArgs {
                 resource_id,
@@ -194,9 +254,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 memory_mib,
                 virtio_blk,
                 net,
+                user_device,
                 ttl_secs,
             }),
             VmAction::Reconcile => vm_reconcile(),
+        },
+        #[cfg(feature = "vhost-user")]
+        Command::Vhost { action } => match action {
+            VhostAction::Serve { socket, source, period_ms, max_bytes } => vhost_serve(
+                socket,
+                source,
+                period_ms,
+                max_bytes,
+            ),
+            VhostAction::EntropyServe { listen } => vhost_entropy_serve(&listen),
+            VhostAction::Pump { connect, out, chunk } => vhost_pump(&connect, &out, chunk),
         },
     }
 }
@@ -502,6 +574,53 @@ fn agent_connect(addr_json: &str) -> Result<(), Box<dyn std::error::Error>> {
     })
 }
 // ---------------------------------------------------------------------------
+// vhost-user CLI (feature-gated, M7)
+// ---------------------------------------------------------------------------
+
+/// Serve one virtio-rng backend; blocks until Cloud Hypervisor disconnects.
+#[cfg(feature = "vhost-user")]
+fn vhost_serve(
+    socket: std::path::PathBuf,
+    source: std::path::PathBuf,
+    period_ms: u128,
+    max_bytes: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let config = nauti_fabric::vhost::RngConfig {
+        socket_path: socket.clone(),
+        source_path: source,
+        period_ms,
+        max_bytes,
+    };
+    println!("serving virtio-rng backend on {}", socket.display());
+    println!(
+        "attach with: nauti vm launch --user-device {} ...",
+        socket.display()
+    );
+    nauti_fabric::vhost::serve_rng(config)?;
+    Ok(())
+}
+
+/// Remote entropy server (device-host half of the stub).
+#[cfg(feature = "vhost-user")]
+fn vhost_entropy_serve(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("entropy server listening on {listen} (length-prefixed requests)");
+    nauti_fabric::vhost::entropy_serve(listen)?;
+    Ok(())
+}
+
+/// Remote entropy pump (VM-host half of the stub).
+#[cfg(feature = "vhost-user")]
+fn vhost_pump(
+    connect: &str,
+    out: &std::path::Path,
+    chunk: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("pumping entropy from {connect} into {}", out.display());
+    nauti_fabric::vhost::entropy_pump(connect, out, chunk)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Cloud Hypervisor CLI (feature-gated)
 // ---------------------------------------------------------------------------
 
@@ -517,6 +636,7 @@ struct VmLaunchArgs {
     memory_mib: String,
     virtio_blk: Option<PathBuf>,
     net: Option<String>,
+    user_device: Option<PathBuf>,
     ttl_secs: u64,
 }
 
@@ -554,6 +674,7 @@ fn vm_launch(args: VmLaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
         memory_mib,
         virtio_blk,
         net,
+        user_device,
         ttl_secs,
     } = args;
     let spec = VmResourceSpec {
@@ -565,6 +686,7 @@ fn vm_launch(args: VmLaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
         memory_mib: Some(memory_mib),
         virtio_blk: virtio_blk.as_ref().map(|path| path.display().to_string()),
         net,
+        user_device: user_device.map(|path| path.display().to_string()),
     };
     let mut attributes = spec.into_attributes();
     attributes.insert("vmm.binary".into(), binary.display().to_string());

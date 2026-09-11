@@ -19,7 +19,8 @@
 //! | `vmm.vm_name`      | (Optional) VM name; defaults to the resource id. |
 //! | `vmm.vcpus`        | (Optional) vCPU count; defaults to `1`. |
 //! | `vmm.memory_mib`   | (Optional) memory size in MiB; defaults to `512`. |
-//! | `vmm.virtio_blk`   | (Optional) extra `--disk path=...` to attach as a second virtio block device (leased virtio/vhost-user device; the rest of this proof covers virtio-blk, with vhost-user being a follow-up that requires the `vhost-user-backend` family). |
+//! | `vmm.virtio_blk`   | (Optional) extra `--disk path=...` to attach as a second virtio block device. |
+//! | `vmm.user_device`  | (Optional) path to a vhost-user backend Unix socket, attached at boot via `--user-device socket=...` (M7; served by `nauti vhost serve`). |
 //!
 //! ## Lifecycle
 //!
@@ -354,6 +355,15 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
         if let Some(net) = attrs.get("vmm.net") {
             argv.push("--net".into());
             argv.push(net.clone());
+        }
+        // vhost-user generic device (M7): `vmm.user_device` holds the Unix
+        // socket path of a running vhost-user backend (e.g. one served by
+        // `nauti vhost serve`). Passed to Cloud Hypervisor as
+        // `--user-device socket=...`; the guest sees an ordinary virtio
+        // device whose backend is the external process.
+        if let Some(user_device) = attrs.get("vmm.user_device") {
+            argv.push("--user-device".into());
+            argv.push(format!("socket={user_device}"));
         }
         Ok(argv)
     }
@@ -890,6 +900,24 @@ mod net_tests {
         assert!(joined.contains("--device path=/sys/bus/pci/devices/0000:d8:00.0"));
         assert!(joined.contains("--device path=/sys/bus/pci/devices/0000:d8:00.1"));
     }
+
+    #[test]
+    fn build_argv_emits_user_device_flag_for_vhost_user_socket() {
+        // M7: a vhost-user backend socket becomes a generic `--user-device`.
+        let launcher = Arc::new(MockLauncher::new(true));
+        let adapter = CloudHypervisorAdapter::with_launcher(
+            PathBuf::from("/mock/cloud-hypervisor"),
+            launcher,
+        );
+        let mut resource = device_resource("vm.vhu0");
+        resource
+            .attributes
+            .insert("vmm.user_device".into(), "/tmp/nauti-vhu-rng.sock".into());
+
+        let joined = adapter.build_argv(&resource).unwrap().join(" ");
+
+        assert!(joined.contains("--user-device socket=/tmp/nauti-vhu-rng.sock"), "argv: {joined}");
+    }
 }
 
 // Re-export the manifest so crate users can build a `Resource` with a stable,
@@ -906,6 +934,9 @@ pub struct VmResourceSpec {
     /// Cloud Hypervisor net spec (e.g. `tap=tap0,mac=…`). When set, the
     /// adapter provisions the tap before spawn and passes `--net`.
     pub net: Option<String>,
+    /// Path to a vhost-user backend Unix socket, attached at boot via
+    /// `--user-device socket=...` (M7; served by `nauti vhost serve`).
+    pub user_device: Option<String>,
 }
 
 impl VmResourceSpec {
@@ -928,6 +959,9 @@ impl VmResourceSpec {
         }
         if let Some(net) = self.net {
             attrs.insert("vmm.net".into(), net);
+        }
+        if let Some(user_device) = self.user_device {
+            attrs.insert("vmm.user_device".into(), user_device);
         }
         attrs
     }

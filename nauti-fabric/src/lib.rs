@@ -9,6 +9,8 @@ pub mod config;
 pub mod topology;
 #[cfg(feature = "cloud-hypervisor")]
 pub mod vmm;
+#[cfg(feature = "vhost-user")]
+pub mod vhost;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};

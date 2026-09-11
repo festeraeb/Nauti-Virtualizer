@@ -20,9 +20,20 @@ hwlocality = { version = "1.0.0-alpha.12", optional = true }
 nvml-wrapper = { version = "0.13.0", optional = true }
 vfio-ioctls = { version = "0.8", optional = true }
 toml = "1.1.5"
+# vhost-user device-backend family (M7). Kept optional so the default
+# build stays dependency-light; versions are pinned to the pair that
+# vhost-user-backend 0.23 itself uses (vm-memory 0.18 shared).
+vhost = { version = "0.17", optional = true }
+vhost-user-backend = { version = "0.23", optional = true }
+virtio-bindings = { version = "0.2.7", optional = true }
+virtio-queue = { version = "0.18", optional = true }
+vmm-sys-util = { version = "0.15", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# MockSplitQueue / build_desc_chain live behind virtio-queue's `test-utils`
+# feature; enabled only for our own tests.
+virtio-queue = { version = "0.18", features = ["test-utils"] }
 
 [features]
 numa = ["dep:hwlocality"]
@@ -40,3 +51,6 @@ rocm = []
 # via `vfio-ioctls`; the adapter re-discovers at every attach and falls back
 # to a host-local reservation if the host has no IOMMU / no vfio-pci bind.
 vfio = ["dep:vfio-ioctls"]
+# vhost-user device backends (M7): serve virtio devices to Cloud Hypervisor
+# over the vhost-user protocol (`nauti vhost serve`, `entropy-serve`, `pump`).
+vhost-user = ["dep:vhost", "dep:vhost-user-backend", "dep:virtio-bindings", "dep:virtio-queue", "dep:vmm-sys-util"]
