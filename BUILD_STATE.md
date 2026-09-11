@@ -152,7 +152,44 @@ fleet-hq is the membership/health view. Neither registry invents GPUs.
       (`install nvidia /bin/true` etc.) + persistenced masked. Boot NVRM
       journal count = 0, no live nvidia-smi/nvidia-modprobe spawns.
 
-## Next: M7 — vhost-user backend proof
+## M7 agent check — PARTIAL 2026-09-11 (core verified; degradation pinned at hypervisor layer; one confound documented)
+
+- [x] Backend + guest connectivity: `nauti vhost serve --socket /tmp/m7-rng.sock --source /dev/urandom`
+      (vhost-user virtio-rng, v53-compatible) — CH connected to it live; daemon exits when the
+      frontend disconnects (observed on VM shutdown).
+- [x] Guest-side device visibility: guest (vmlinuz-5.15-jammy + initramfs from the jammy
+      cloud-image, `--memory size=2G,shared=on`) saw the vhost-user virtio-rng PCI device
+      `1af4:1044` at `0000:00:04.0`; `virtio_rng` module loaded; `/dev/hwrng` present;
+      two hwrngs registered (`virtio_rng.0`, `virtio_rng.1`).
+- [x] Degradation (hypervisor layer, authoritative): on backend `kill -9`, CH v53 detects the
+      disconnect, retries the socket for 1 minute, then fails with `Connection refused` and sets
+      the device to `NEEDS_RESET`, stopping queue processing. VM stays `Running` throughout.
+- [x] CH v53 syntax facts (hard-won): `--user-device` is the **vfio-user** path, NOT
+      vhost-user (fails with `VfioUserCreateClient` against a vhost-user backend). The generic
+      vhost-user path is `--generic-vhost-user device_type=rng,socket=<path>,queue_sizes=1024`
+      (plural `queue_sizes`; `queue_size` is rejected; numeric device_type 4 or `rng` accepted).
+      Initrd flag is `--initramfs`. Guest memory needs `shared=on` for any vhost-user device.
+- [x] Working CH v53 boot line (proof of record):
+      `cloud-hypervisor --api-socket /tmp/ch-m7.sock --kernel ~/vm-images/vmlinuz-5.15-jammy
+      --initramfs ~/vm-images/initrd-5.15-jammy --disk path=/tmp/m7-root.raw --cpus boot=2
+      --memory size=2G,shared=on --cmdline "console=ttyS0 root=/dev/vda1 rw
+      modules-load=virtio_rng" --console pty --serial file=/tmp/m7-serial.log
+      --generic-vhost-user device_type=rng,socket=/tmp/m7-rng.sock,queue_sizes=1024`
+- [ ] **Known confound (open)**: CH v53 also auto-instantiates a built-in virtio-rng
+      (`rng.src=/dev/urandom` in the VM config — second `1af4:1044` at `0000:00:03.0`). The
+      hwrng core routes `/dev/hwrng` to its "current" rng, so guest reads served post-kill
+      cannot be attributed to the vhost-user device with certainty (built-in rng survived the
+      kill by design). Guest-side kill-test reads continued to succeed, which is consistent
+      with reads going to the built-in rng and/or a pre-filled vring backlog. Follow-up:
+      eliminate the built-in rng (or `echo` the vhost-user instance into
+      `/sys/devices/virtual/misc/hw_random/rng_current`), re-run proof + backend-kill, expect
+      reads to stall once the backlog drains. Also unverified: remote-stub variant
+      (`entropy-serve` + `pump` across hosts).
+- [ ] **Adapter follow-up**: `vmm.user_device` currently emits `--user-device` (vfio-user);
+      for vhost-user backends it must emit `--generic-vhost-user device_type=…,socket=…,queue_sizes=…`
+      (M7 close-out item before M8).
+
+## Next: M8 — Shared filesystem story
 
 ## M5 agent check — CLOSED 2026-09-10
 
