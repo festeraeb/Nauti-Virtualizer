@@ -8,5 +8,7 @@ Missing implementation is concentrated in the integration layer, not reimplement
 - No Cloud Hypervisor reconciliation, virtio/vhost-user backend, VM boot, hotplug, or hot-remove proof.
 - No audit store, authentication/authorization, metrics exporter, or production observability pipeline.
 - DRust/CXL/DAX/famfs are research directions; none is claimed as a deployable coherent-memory backend here.
+  Live 2026-09-26: `memory-research` discovers and refuses attach (`claimed_as_live_ram=false` on c2/c3).
+- Remote GPU (M10) is no longer a gap: wgpu-remote add job over Tailscale CGNAT closed 2026-09-26.
 
 These are intentional gaps. Each needs a bounded proof before production design.

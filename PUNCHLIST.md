@@ -97,6 +97,12 @@ Not before M9. Driven by a real remote-render/compute job, not speculation.
 
 Agent check: workload-defined perf/correctness bar, met or the milestone reopens.
 
+**CLOSED 2026-09-26 (Tailscale off-routing).** Workload = 4096-wide f32 add
+WGSL on the GPU node. Correctness = match CPU reference. Path = bind/connect
+only on `100.64.0.0/10` (LAN `192.168.4.x` refused). Live: c3
+`100.76.255.40` → c2 `100.109.55.22:9110`, Vulkan `NVIDIA P106-100`,
+status `ok`, 1561 ms. Not a second GPU scheduler.
+
 ## Build-out order (why this sequence)
 
 Contract (M1) → single truth (M2) → execution without SSH (M3) → policy-governed
@@ -105,3 +111,8 @@ freedom (M9) → exotic transports (M10). Each layer only depends on the one bel
 it. Skipping ahead recreates the two-fabrics drift.
 
 CXL/DAX/famfs + DRust stay research throughout — tracked, never claimed.
+**Typed close 2026-09-26:** `nauti research discover` + `memory-research`
+adapter. Both c2 and c3 report `claimed_as_live_ram=false` (no CXL bus,
+no `/dev/dax*`, no famfs, no DRust). Attach is
+`AdapterBackendUnavailable`. This plane is live as a refuse path, not as
+coherent RAM.

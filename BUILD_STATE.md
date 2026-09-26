@@ -175,21 +175,102 @@ fleet-hq is the membership/health view. Neither registry invents GPUs.
       --memory size=2G,shared=on --cmdline "console=ttyS0 root=/dev/vda1 rw
       modules-load=virtio_rng" --console pty --serial file=/tmp/m7-serial.log
       --generic-vhost-user device_type=rng,socket=/tmp/m7-rng.sock,queue_sizes=1024`
-- [ ] **Known confound (open)**: CH v53 also auto-instantiates a built-in virtio-rng
-      (`rng.src=/dev/urandom` in the VM config — second `1af4:1044` at `0000:00:03.0`). The
-      hwrng core routes `/dev/hwrng` to its "current" rng, so guest reads served post-kill
-      cannot be attributed to the vhost-user device with certainty (built-in rng survived the
-      kill by design). Guest-side kill-test reads continued to succeed, which is consistent
-      with reads going to the built-in rng and/or a pre-filled vring backlog. Follow-up:
-      eliminate the built-in rng (or `echo` the vhost-user instance into
-      `/sys/devices/virtual/misc/hw_random/rng_current`), re-run proof + backend-kill, expect
-      reads to stall once the backlog drains. Also unverified: remote-stub variant
-      (`entropy-serve` + `pump` across hosts).
-- [ ] **Adapter follow-up**: `vmm.user_device` currently emits `--user-device` (vfio-user);
-      for vhost-user backends it must emit `--generic-vhost-user device_type=…,socket=…,queue_sizes=…`
-      (M7 close-out item before M8).
+- [x] **Builtin rng named, not omitted**: CH v53 cannot drop the builtin virtio-rng.
+      `build_argv` always emits `--rng src=…,id=ch-builtin-rng` (override via
+      `vmm.rng_src`). Guest pins the vhost-user instance with
+      `/sys/devices/virtual/misc/hw_random/rng_current`. Kill-test attribution
+      is `rng_current`, not "CH has no rng".
+- [x] **Remote entropy stub**: `vhost/entropy.rs` unit-tests `entropy-serve` +
+      `pump` across hosts. Live guest `rng_current` kill-test is the remaining
+      jammy-boot proof (not a code gap).
+- [x] **Adapter follow-up**: `vmm.user_device` now emits `--generic-vhost-user device_type=…,socket=…,queue_sizes=…` (CH v53 correct path). `vmm.user_device_type` (default "rng") and `vmm.user_device_queue_sizes` (default "1024") attrs supported; test coverage added.
 
-## Next: M8 — Shared filesystem story
+## M8 agent check — CLOSED in code 2026-09-25
+
+Declared decision, no silent third option:
+
+- Guest attach: Cloud Hypervisor virtio-fs (`--fs tag=,socket=`).
+- Host / job attach: same directory as a bind path (`store.path`).
+- Cross-node: NFS only when `store.kind=nfs` + `store.nfs_export`.
+
+- [x] `store.rs` — `StoreResolution` + `FabricStoreAdapter`; detach on
+      `Fabric::release`.
+- [x] Host inventory advertises exclusive `local.store.fabric`.
+- [x] Same job path for bind and virtio-fs; NFS export is the job path.
+- [x] `shared=on` when `--fs` / `--vsock` / `--generic-vhost-user`.
+- [x] **LIVE 2026-09-26 on cesarops2** (t440/c4 untouched): virtiofsd
+      `--socket-path` + `--shared-dir /var/lib/nauti/store`, CH `--fs tag=nauti`.
+      Guest `/mnt/nauti` saw `host-marker`; host saw `guest-marker nauti-jammy`
+      at the same `store.path`. `nauti fabric lease/attach/release` on
+      `local.store.fabric` → `released=true` (detach). CH v53 rejects qcow
+      backing-file overlays (`MaxNestingDepthExceeded`); flattened qcow2 used.
+
+## M9 agent check — CLOSED in contract 2026-09-25; LIVE 2026-09-26
+
+- [x] `peer.rs` — `PeerJob` / `PeerResult` same envelope for `PeerKind::Bare`
+      and `PeerKind::Vm`.
+- [x] Killing the VM degrades that domain only; bare envelope unchanged.
+- [x] Default vsock spec `cid=3,socket=…` for guest `agent-serve`.
+- [x] `--vsock` / `--watchdog` / `--cmdline` / `--initramfs` in CH argv.
+- [x] **LIVE 2026-09-26**: jammy guest had `/dev/vsock` (cid=3). Same
+      `PeerJob` `m9-live-1` / `echo` on cesarops3 bare (`kind=bare`) and
+      guest (`kind=vm`). After `ch-remote shutdown` the VM is gone;
+      cesarops3 envelope sha256 unchanged
+      (`7fe168e7812c6f1f69c12434bebd29fbe455db36c1716b211ef4dae3d2b25b66`).
+      Guest `nauti` binary from the 24.04 host did not exec
+      (`GLIBC_2.39` missing on jammy 22.04) — vsock + envelope closed;
+      in-guest Iroh `agent-serve` needs a jammy-linked nauti.
+
+## M7 live kill-test — CLOSED 2026-09-26 (cesarops2)
+
+- [x] Jammy 22.04.5 CH v53 `state=Running` with `--rng src=/dev/urandom,id=ch-builtin-rng`
+      and `--generic-vhost-user device_type=rng,socket=…,queue_sizes=1024`.
+- [x] Guest `rng_available` = `virtio_rng.0 virtio_rng.1`; `rng_current`
+      pinned to `virtio_rng.1` (vhost). Builtin remains named `ch-builtin-rng`.
+- [x] `kill -9` of `nauti vhost serve`: guest `dd if=/dev/hwrng` exit 124
+      (timeout), 0 bytes; VM stayed `Running`. First boot also hung the
+      kernel `hwrng` thread for 120s on the pinned device — same attribution.
+
+## IOMMU repair node — LIVE 2026-09-26 (c2 head / c3 peer)
+
+- [x] `nauti_iommu_repair.py` + systemd timer 30s on both nodes. No OpenVINO.
+- [x] Hypervisor head = `NAUTI_HYPERVISOR_HEAD=cesarops2` (CH + VFIO domain).
+      Standing order on c2: iLO `192.168.4.35` ForceRestart, one-shot, 3×30s.
+- [x] Peer may only execute that order. c3 `--repair --ask`:
+      `hold / head_reachable_peer_does_not_reboot`, Lemonade `vote=false`.
+- [x] Head `--repair`: `hold / head_alive_no_orphaned_lease` — group count 0
+      this boot is parked (`iommu=pt`, no `intel_iommu=on`), not a reboot.
+- [x] Health HTTP `:9106` on LAN `192.168.4.0/22` (ufw opened). Split-brain
+      and Lemonade/PXA never reboot.
+- [x] Optional CPU bake-off: c3 Lemonade `Qwen3-14B-GGUF` one completion
+      (`vote=false`, `repair_path=false`). No PXQ. No P100 steal.
+
+## M10 agent check — CLOSED 2026-09-26 (Tailscale off-routing)
+
+- [x] Workload: 4096-wide f32 add (`gpu/add.wgsl`) on the GPU node.
+- [x] Correctness bar: remote output matches CPU reference (`status=ok`).
+- [x] Off-routing: `nauti wgpu serve/run` refuse LAN. Live sockets were
+      `100.109.55.22:9110` (c2) and `100.76.255.40:38280` (c3).
+- [x] Backend: wgpu Vulkan `NVIDIA P106-100`, 1561 ms. Not a scheduler.
+- [x] LAN bind/connect on `192.168.4.38:9110` exits 1 with a typed refuse.
+
+## Research memory bucket — TYPED CLOSE 2026-09-26 (not live RAM)
+
+- [x] `nauti research discover` on c2 and c3: `cxl_bus=false`, no DAX, no
+      famfs, `drust_present=false`, `claimed_as_live_ram=false`.
+- [x] `memory-research` attach is `AdapterBackendUnavailable`. DRust stays
+      an OSDI 2024 artifact, not a nauti backend.
+
+## Four-node agent deploy — 2026-09-26 (pre SFP+ c4↔t440)
+
+- [x] `nauti` + `agent-serve` + health `:9106` + repair timer on t440, c2, c3, c4.
+- [x] `forge-fleet-worker` restored on c4 (`cesarops4om` Online, 6 GPUs).
+- [x] From t440: fabric ping c2/c3/c4/self = Pong. wgpu Tailscale
+      `100.72.182.77` → `100.109.55.22:9110` status ok.
+- [x] HQ `/v1/fleet`: 4 linux nodes Online (t440, c2, c3, c4om). Paddler :8080
+      and Forge v3 :8099 200.
+- Hypervisor head remains cesarops2. SFP+ c4↔t440 is a later physical cutover;
+  current path is LAN + Tailscale.
 
 ## M5 agent check — CLOSED 2026-09-10
 

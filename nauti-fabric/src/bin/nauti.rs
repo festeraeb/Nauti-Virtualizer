@@ -113,6 +113,41 @@ enum Command {
         #[command(subcommand)]
         action: VhostAction,
     },
+    /// M10 remote GPU job. `--via tailscale` refuses LAN addresses.
+    Wgpu {
+        #[command(subcommand)]
+        action: WgpuAction,
+    },
+    /// CXL/DAX/famfs/DRust research plane: discover and refuse live attach.
+    Research {
+        #[command(subcommand)]
+        action: ResearchAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum WgpuAction {
+    /// Serve the wgpu-remote add kernel on a Tailscale bind address.
+    Serve {
+        #[arg(long)]
+        bind: String,
+    },
+    /// Submit the correctness-bar job to a Tailscale peer.
+    Run {
+        #[arg(long)]
+        connect: String,
+        #[arg(long, default_value_t = nauti_fabric::gpu::wgpu_remote::WORKLOAD_N)]
+        n: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum ResearchAction {
+    /// Walk CXL/DAX/famfs/DRust and print the typed report (never claimed).
+    Discover {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// M7 vhost-user subcommands. `serve` is the device backend (blocks until
@@ -207,6 +242,27 @@ enum VmAction {
         /// `--user-device socket=...` (M7; serve one with `nauti vhost serve`).
         #[arg(long)]
         user_device: Option<PathBuf>,
+        /// virtio-fs spec, e.g. `tag=nauti,socket=/tmp/virtiofs.sock` (M8).
+        #[arg(long)]
+        fs: Option<String>,
+        /// vsock spec, e.g. `cid=3,socket=/tmp/nauti-vsock.sock` (M9).
+        #[arg(long)]
+        vsock: Option<String>,
+        /// Enable Cloud Hypervisor virtio-watchdog.
+        #[arg(long, default_value_t = false)]
+        watchdog: bool,
+        /// Guest kernel cmdline.
+        #[arg(long)]
+        cmdline: Option<String>,
+        /// Optional initramfs path.
+        #[arg(long)]
+        initramfs: Option<PathBuf>,
+        /// Builtin virtio-rng source (default /dev/urandom). Named id=ch-builtin-rng.
+        #[arg(long)]
+        rng_src: Option<String>,
+        /// Force guest memory shared=on.
+        #[arg(long, default_value_t = false)]
+        shared: bool,
         /// Lease TTL in seconds (default 30).
         #[arg(long, default_value = "30")]
         ttl_secs: u64,
@@ -242,6 +298,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 virtio_blk,
                 net,
                 user_device,
+                fs,
+                vsock,
+                watchdog,
+                cmdline,
+                initramfs,
+                rng_src,
+                shared,
                 ttl_secs,
             } => vm_launch(VmLaunchArgs {
                 resource_id,
@@ -255,6 +318,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 virtio_blk,
                 net,
                 user_device,
+                fs,
+                vsock,
+                watchdog,
+                cmdline,
+                initramfs,
+                rng_src,
+                shared,
                 ttl_secs,
             }),
             VmAction::Reconcile => vm_reconcile(),
@@ -269,6 +339,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             VhostAction::EntropyServe { listen } => vhost_entropy_serve(&listen),
             VhostAction::Pump { connect, out, chunk } => vhost_pump(&connect, &out, chunk),
+        },
+        Command::Wgpu { action } => match action {
+            WgpuAction::Serve { bind } => wgpu_serve(&bind),
+            WgpuAction::Run { connect, n } => wgpu_run(&connect, n),
+        },
+        Command::Research { action } => match action {
+            ResearchAction::Discover { json } => research_discover(json),
         },
     }
 }
@@ -305,6 +382,9 @@ fn adapters(json: bool) -> Result<(), Box<dyn std::error::Error>> {
         api_key: std::env::var("LEMONADE_API_KEY").ok(),
     });
     fabric.register_adapter(Arc::new(lemonade));
+    fabric.register_adapter(Arc::new(nauti_fabric::FabricStoreAdapter::new()));
+    fabric.register_adapter(Arc::new(nauti_fabric::WgpuRemoteAdapter));
+    fabric.register_adapter(Arc::new(nauti_fabric::ResearchMemoryAdapter));
     let reports = fabric.adapter_reports();
 
     if json {
@@ -514,6 +594,9 @@ fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
             attributes: BTreeMap::from([("adapter".into(), "proof".into())]),
         });
         fabric.register_adapter(Arc::new(LocalProofAdapter));
+        fabric.register_adapter(Arc::new(nauti_fabric::FabricStoreAdapter::new()));
+        fabric.register_adapter(Arc::new(nauti_fabric::WgpuRemoteAdapter));
+        fabric.register_adapter(Arc::new(nauti_fabric::ResearchMemoryAdapter));
 
         let (router, addr) = nauti_fabric::rpc::serve(fabric).await?;
         println!("nauti agent listening; endpoint address (paste into agent-connect):");
@@ -637,6 +720,13 @@ struct VmLaunchArgs {
     virtio_blk: Option<PathBuf>,
     net: Option<String>,
     user_device: Option<PathBuf>,
+    fs: Option<String>,
+    vsock: Option<String>,
+    watchdog: bool,
+    cmdline: Option<String>,
+    initramfs: Option<PathBuf>,
+    rng_src: Option<String>,
+    shared: bool,
     ttl_secs: u64,
 }
 
@@ -675,6 +765,13 @@ fn vm_launch(args: VmLaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
         virtio_blk,
         net,
         user_device,
+        fs,
+        vsock,
+        watchdog,
+        cmdline,
+        initramfs,
+        rng_src,
+        shared,
         ttl_secs,
     } = args;
     let spec = VmResourceSpec {
@@ -687,6 +784,15 @@ fn vm_launch(args: VmLaunchArgs) -> Result<(), Box<dyn std::error::Error>> {
         virtio_blk: virtio_blk.as_ref().map(|path| path.display().to_string()),
         net,
         user_device: user_device.map(|path| path.display().to_string()),
+        user_device_type: None,
+        user_device_queue_sizes: None,
+        fs,
+        vsock,
+        watchdog: watchdog.then(|| "on".into()),
+        cmdline,
+        initramfs: initramfs.map(|path| path.display().to_string()),
+        rng_src,
+        shared: shared.then(|| "on".into()),
     };
     let mut attributes = spec.into_attributes();
     attributes.insert("vmm.binary".into(), binary.display().to_string());
@@ -754,7 +860,7 @@ enum FabricAction {
         exclusive: bool,
     },
     /// Take an exclusive, time-bounded lease on one resource; prints the
-    /// lease as JSON (feed it back to `fabric release`).
+    /// lease as JSON (feed it back to `fabric attach` / `fabric release`).
     Lease {
         addr: String,
         #[arg(long)]
@@ -764,7 +870,18 @@ enum FabricAction {
         #[arg(long, default_value_t = 300)]
         ttl_secs: u64,
     },
+    /// Attach a leased resource through a named adapter (M8 store detach
+    /// needs a live attachment so `release` can call detach).
+    Attach {
+        addr: String,
+        #[arg(long, default_value = "fabric-store")]
+        adapter: String,
+        /// The lease JSON printed by `fabric lease`.
+        #[arg(long = "lease-json")]
+        lease_json: String,
+    },
     /// Release a lease (pass the lease JSON printed by `fabric lease`).
+    /// Detaches any recorded attachment first.
     Release {
         addr: String,
         /// The lease JSON printed by `fabric lease`.
@@ -785,6 +902,7 @@ fn fabric_action(action: FabricAction) -> Result<(), Box<dyn std::error::Error>>
             | FabricAction::Inventory { addr }
             | FabricAction::Find { addr, .. }
             | FabricAction::Lease { addr, .. }
+            | FabricAction::Attach { addr, .. }
             | FabricAction::Release { addr, .. } => addr.clone(),
         };
         let addr: iroh::EndpointAddr = serde_json::from_str(&addr)
@@ -856,6 +974,20 @@ fn fabric_action(action: FabricAction) -> Result<(), Box<dyn std::error::Error>>
                         other => Err(format!("expected Leased response, got {other:?}")),
                     }
                 }
+                FabricAction::Attach { adapter, lease_json, .. } => {
+                    let lease: Lease = serde_json::from_str(&lease_json)
+                        .map_err(|error| format!("lease JSON is not a Lease: {error}"))?;
+                    let response = client
+                        .call(RpcRequest::Attach { adapter, lease })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match response {
+                        RpcResponse::Attached(attachment) => serde_json::to_string_pretty(&attachment)
+                            .map_err(|e| e.to_string()),
+                        RpcResponse::Error(error) => Err(format!("attach rejected: {}", error.message)),
+                        other => Err(format!("expected Attached response, got {other:?}")),
+                    }
+                }
                 FabricAction::Release { lease_json, .. } => {
                     let lease: Lease = serde_json::from_str(&lease_json)
                         .map_err(|error| format!("lease JSON is not a Lease: {error}"))?;
@@ -901,6 +1033,39 @@ fn persist_addr_json_to(path: &str, json: &str) -> Result<String, String> {
     }
     std::fs::write(path, json).map_err(|error| format!("{path}: {error}"))?;
     Ok(path.to_string())
+}
+
+fn wgpu_serve(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = nauti_fabric::gpu::wgpu_remote::parse_bind(bind)?;
+    nauti_fabric::gpu::wgpu_remote::serve(addr).map_err(|e| e.into())
+}
+
+fn wgpu_run(connect: &str, n: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let addr = nauti_fabric::gpu::wgpu_remote::parse_bind(connect)?;
+    let job = nauti_fabric::gpu::wgpu_remote::sample_job(n);
+    let result = nauti_fabric::gpu::wgpu_remote::submit(addr, &job)?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    if result.status != "ok" {
+        return Err(format!("wgpu-remote job status {}", result.status).into());
+    }
+    Ok(())
+}
+
+fn research_discover(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let report = nauti_fabric::ResearchMemoryReport::discover();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "cxl_bus={} dax={} famfs={} drust={} claimed={}",
+            report.cxl_bus,
+            report.dax_nodes.len(),
+            report.famfs_mounts.len(),
+            report.drust_present,
+            report.claimed_as_live_ram
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

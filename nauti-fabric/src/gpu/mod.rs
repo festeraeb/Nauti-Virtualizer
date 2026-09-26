@@ -168,6 +168,9 @@ pub use nvml_legacy::{GpuDeviceReport, GpuError, GpuTopology};
 
 pub mod discover;
 pub mod adapter;
+pub mod wgpu_remote;
+#[cfg(feature = "wgpu-remote")]
+pub mod wgpu_kernel;
 #[cfg(feature = "rocm")]
 pub mod rocm;
 

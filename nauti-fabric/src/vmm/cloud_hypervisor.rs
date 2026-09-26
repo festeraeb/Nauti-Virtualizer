@@ -310,6 +310,16 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
             .get("vmm.memory_mib")
             .cloned()
             .unwrap_or_else(|| "512".into());
+        // vhost-user, virtio-fs, and vsock all need guest RAM shared with
+        // the backend via memfd. CH v53: `shared=on` on `--memory`.
+        let needs_shared = attrs.contains_key("vmm.user_device")
+            || attrs.contains_key("vmm.fs")
+            || attrs.contains_key("vmm.vsock")
+            || attrs.get("vmm.shared").is_some_and(|value| value == "on" || value == "true");
+        let mut memory = format!("size={memory_mib}M");
+        if needs_shared {
+            memory.push_str(",shared=on");
+        }
 
         let mut argv: Vec<String> = vec![
             "--api-socket".into(),
@@ -317,9 +327,7 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
             "--cpus".into(),
             format!("boot={vcpus}"),
             "--memory".into(),
-            // CH's `size=` key takes bytes or a suffixed value; the adapter
-            // contract (vmm.memory_mib) is MiB, so append the M suffix.
-            format!("size={memory_mib}M"),
+            memory,
             "--kernel".into(),
             kernel,
             "--disk".into(),
@@ -331,6 +339,24 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
             // Cloud Hypervisor v53+ does not accept a --name flag; the VM
             // identity is carried in the resource id + api_socket path.
         ];
+        // CH v53 always instantiates a built-in virtio-rng (default
+        // src=/dev/urandom). There is no CLI off switch — `RngConfig` is
+        // required in VmConfig. Name it so a guest can pin `rng_current`
+        // to the vhost-user device and the kill-test is attributable.
+        let rng_src = attrs
+            .get("vmm.rng_src")
+            .map(String::as_str)
+            .unwrap_or("/dev/urandom");
+        argv.push("--rng".into());
+        argv.push(format!("src={rng_src},id=ch-builtin-rng"));
+        if let Some(initramfs) = attrs.get("vmm.initramfs") {
+            argv.push("--initramfs".into());
+            argv.push(initramfs.clone());
+        }
+        if let Some(cmdline) = attrs.get("vmm.cmdline") {
+            argv.push("--cmdline".into());
+            argv.push(cmdline.clone());
+        }
         if let Some(extra_disk) = attrs.get("vmm.virtio_blk") {
             argv.push("--disk".into());
             argv.push(format!("path={extra_disk}"));
@@ -356,14 +382,49 @@ impl<L: Launcher> CloudHypervisorAdapter<L> {
             argv.push("--net".into());
             argv.push(net.clone());
         }
-        // vhost-user generic device (M7): `vmm.user_device` holds the Unix
-        // socket path of a running vhost-user backend (e.g. one served by
-        // `nauti vhost serve`). Passed to Cloud Hypervisor as
-        // `--user-device socket=...`; the guest sees an ordinary virtio
-        // device whose backend is the external process.
+        // vhost-user generic device (M7 close-out): `vmm.user_device` holds
+        // the Unix socket path of a running vhost-user backend (e.g. one
+        // served by `nauti vhost serve`). CH v53 hard-won fact: `--user-device`
+        // is the *vfio-user* path, NOT vhost-user (it fails with
+        // `VfioUserCreateClient` against a vhost-user backend). The generic
+        // vhost-user path is
+        //   --generic-vhost-user device_type=<type>,socket=<path>,queue_sizes=<n>
+        // (`queue_sizes` is plural; singular `queue_size` is rejected).
+        // Device type comes from `vmm.user_device_type` (default "rng";
+        // numeric ids like "4" are also accepted by CH). Queue sizes come
+        // from `vmm.user_device_queue_sizes` (default "1024"). Guest memory
+        // must be launched with `shared=on` for any vhost-user device.
         if let Some(user_device) = attrs.get("vmm.user_device") {
-            argv.push("--user-device".into());
-            argv.push(format!("socket={user_device}"));
+            let device_type = attrs
+                .get("vmm.user_device_type")
+                .map(String::as_str)
+                .unwrap_or("rng");
+            let queue_sizes = attrs
+                .get("vmm.user_device_queue_sizes")
+                .map(String::as_str)
+                .unwrap_or("1024");
+            argv.push("--generic-vhost-user".into());
+            argv.push(format!(
+                "device_type={device_type},socket={user_device},queue_sizes={queue_sizes}"
+            ));
+        }
+        // M8 guest store: Cloud Hypervisor virtio-fs. Same store.path the
+        // fabric-store adapter leased; backend socket is virtiofsd.
+        if let Some(fs) = attrs.get("vmm.fs") {
+            argv.push("--fs".into());
+            argv.push(fs.clone());
+        }
+        // M9 zero-SSH guest agent: vsock to the host. CH v53:
+        // --vsock cid=3,socket=/path
+        if let Some(vsock) = attrs.get("vmm.vsock") {
+            argv.push("--vsock".into());
+            argv.push(vsock.clone());
+        }
+        if attrs
+            .get("vmm.watchdog")
+            .is_some_and(|value| value == "on" || value == "true")
+        {
+            argv.push("--watchdog".into());
         }
         Ok(argv)
     }
@@ -902,8 +963,8 @@ mod net_tests {
     }
 
     #[test]
-    fn build_argv_emits_user_device_flag_for_vhost_user_socket() {
-        // M7: a vhost-user backend socket becomes a generic `--user-device`.
+    fn build_argv_emits_generic_vhost_user_for_vhost_user_socket() {
+        // M7 close-out: CH v53 requires --generic-vhost-user for vhost-user backends.
         let launcher = Arc::new(MockLauncher::new(true));
         let adapter = CloudHypervisorAdapter::with_launcher(
             PathBuf::from("/mock/cloud-hypervisor"),
@@ -916,7 +977,82 @@ mod net_tests {
 
         let joined = adapter.build_argv(&resource).unwrap().join(" ");
 
-        assert!(joined.contains("--user-device socket=/tmp/nauti-vhu-rng.sock"), "argv: {joined}");
+        // Default device_type=rng, queue_sizes=1024
+        assert!(joined.contains("--generic-vhost-user"), "argv: {joined}");
+        assert!(joined.contains("device_type=rng"), "argv: {joined}");
+        assert!(joined.contains("socket=/tmp/nauti-vhu-rng.sock"), "argv: {joined}");
+        assert!(joined.contains("queue_sizes=1024"), "argv: {joined}");
+    }
+
+    #[test]
+    fn build_argv_emits_custom_vhost_user_params() {
+        let launcher = Arc::new(MockLauncher::new(true));
+        let adapter = CloudHypervisorAdapter::with_launcher(
+            PathBuf::from("/mock/cloud-hypervisor"),
+            launcher,
+        );
+        let mut resource = device_resource("vm.vhu1");
+        resource.attributes.insert("vmm.user_device".into(), "/tmp/custom.sock".into());
+        resource.attributes.insert("vmm.user_device_type".into(), "4".into()); // numeric id
+        resource.attributes.insert("vmm.user_device_queue_sizes".into(), "2048".into());
+
+        let joined = adapter.build_argv(&resource).unwrap().join(" ");
+
+        assert!(joined.contains("--generic-vhost-user"), "argv: {joined}");
+        assert!(joined.contains("device_type=4"), "argv: {joined}");
+        assert!(joined.contains("socket=/tmp/custom.sock"), "argv: {joined}");
+        assert!(joined.contains("queue_sizes=2048"), "argv: {joined}");
+    }
+
+    #[test]
+    fn build_argv_emits_fs_and_forces_shared_memory() {
+        let launcher = Arc::new(MockLauncher::new(true));
+        let adapter = CloudHypervisorAdapter::with_launcher(
+            PathBuf::from("/mock/cloud-hypervisor"),
+            launcher,
+        );
+        let mut resource = device_resource("vm.fs0");
+        resource
+            .attributes
+            .insert("vmm.fs".into(), "tag=nauti,socket=/tmp/virtiofs.sock".into());
+
+        let joined = adapter.build_argv(&resource).unwrap().join(" ");
+        assert!(joined.contains("--fs tag=nauti,socket=/tmp/virtiofs.sock"), "argv: {joined}");
+        assert!(joined.contains("--memory size=512M,shared=on"), "argv: {joined}");
+        assert!(joined.contains("--rng src=/dev/urandom,id=ch-builtin-rng"), "argv: {joined}");
+    }
+
+    #[test]
+    fn build_argv_emits_vsock_and_forces_shared_memory() {
+        let launcher = Arc::new(MockLauncher::new(true));
+        let adapter = CloudHypervisorAdapter::with_launcher(
+            PathBuf::from("/mock/cloud-hypervisor"),
+            launcher,
+        );
+        let mut resource = device_resource("vm.vs0");
+        resource
+            .attributes
+            .insert("vmm.vsock".into(), "cid=3,socket=/tmp/nauti-vsock.sock".into());
+
+        let joined = adapter.build_argv(&resource).unwrap().join(" ");
+        assert!(joined.contains("--vsock cid=3,socket=/tmp/nauti-vsock.sock"), "argv: {joined}");
+        assert!(joined.contains("--memory size=512M,shared=on"), "argv: {joined}");
+    }
+
+    #[test]
+    fn build_argv_watchdog_and_plain_memory_without_shared() {
+        let launcher = Arc::new(MockLauncher::new(true));
+        let adapter = CloudHypervisorAdapter::with_launcher(
+            PathBuf::from("/mock/cloud-hypervisor"),
+            launcher,
+        );
+        let mut resource = device_resource("vm.wd0");
+        resource.attributes.insert("vmm.watchdog".into(), "on".into());
+
+        let joined = adapter.build_argv(&resource).unwrap().join(" ");
+        assert!(joined.contains("--watchdog"), "argv: {joined}");
+        assert!(joined.contains("--memory size=512M"), "argv: {joined}");
+        assert!(!joined.contains("shared=on"), "argv: {joined}");
     }
 }
 
@@ -935,8 +1071,25 @@ pub struct VmResourceSpec {
     /// adapter provisions the tap before spawn and passes `--net`.
     pub net: Option<String>,
     /// Path to a vhost-user backend Unix socket, attached at boot via
-    /// `--user-device socket=...` (M7; served by `nauti vhost serve`).
+    /// `--generic-vhost-user device_type=...,socket=...,queue_sizes=...`
+    /// (M7 close-out; served by `nauti vhost serve`).
     pub user_device: Option<String>,
+    /// vhost-user device type string or numeric id (default "rng";
+    /// numeric ids like "4" accepted by CH v53).
+    pub user_device_type: Option<String>,
+    /// vhost-user queue sizes (default "1024"; plural required by CH v53).
+    pub user_device_queue_sizes: Option<String>,
+    /// virtio-fs spec `tag=…,socket=…` (M8).
+    pub fs: Option<String>,
+    /// vsock spec `cid=3,socket=…` (M9).
+    pub vsock: Option<String>,
+    /// `on`/`true` enables CH `--watchdog`.
+    pub watchdog: Option<String>,
+    pub cmdline: Option<String>,
+    pub initramfs: Option<String>,
+    pub rng_src: Option<String>,
+    /// Force `shared=on` even without fs/vsock/user_device.
+    pub shared: Option<String>,
 }
 
 impl VmResourceSpec {
@@ -962,6 +1115,33 @@ impl VmResourceSpec {
         }
         if let Some(user_device) = self.user_device {
             attrs.insert("vmm.user_device".into(), user_device);
+        }
+        if let Some(user_device_type) = self.user_device_type {
+            attrs.insert("vmm.user_device_type".into(), user_device_type);
+        }
+        if let Some(user_device_queue_sizes) = self.user_device_queue_sizes {
+            attrs.insert("vmm.user_device_queue_sizes".into(), user_device_queue_sizes);
+        }
+        if let Some(fs) = self.fs {
+            attrs.insert("vmm.fs".into(), fs);
+        }
+        if let Some(vsock) = self.vsock {
+            attrs.insert("vmm.vsock".into(), vsock);
+        }
+        if let Some(watchdog) = self.watchdog {
+            attrs.insert("vmm.watchdog".into(), watchdog);
+        }
+        if let Some(cmdline) = self.cmdline {
+            attrs.insert("vmm.cmdline".into(), cmdline);
+        }
+        if let Some(initramfs) = self.initramfs {
+            attrs.insert("vmm.initramfs".into(), initramfs);
+        }
+        if let Some(rng_src) = self.rng_src {
+            attrs.insert("vmm.rng_src".into(), rng_src);
+        }
+        if let Some(shared) = self.shared {
+            attrs.insert("vmm.shared".into(), shared);
         }
         attrs
     }

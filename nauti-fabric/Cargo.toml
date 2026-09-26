@@ -28,6 +28,9 @@ vhost-user-backend = { version = "0.23", optional = true }
 virtio-bindings = { version = "0.2.7", optional = true }
 virtio-queue = { version = "0.18", optional = true }
 vmm-sys-util = { version = "0.15", optional = true }
+wgpu = { version = "0.20", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1.22", optional = true, features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -54,3 +57,5 @@ vfio = ["dep:vfio-ioctls"]
 # vhost-user device backends (M7): serve virtio devices to Cloud Hypervisor
 # over the vhost-user protocol (`nauti vhost serve`, `entropy-serve`, `pump`).
 vhost-user = ["dep:vhost", "dep:vhost-user-backend", "dep:virtio-bindings", "dep:virtio-queue", "dep:vmm-sys-util"]
+# M10 remote GPU. Optional so default/CI hosts without Vulkan stay light.
+wgpu-remote = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]

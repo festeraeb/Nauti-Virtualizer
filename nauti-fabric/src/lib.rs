@@ -2,9 +2,12 @@
 
 pub mod adapters;
 pub mod gpu;
+pub mod peer;
 pub mod rpc;
 pub mod rpc_auth;
 pub mod config;
+pub mod store;
+pub mod memory;
 #[cfg(feature = "numa")]
 pub mod topology;
 #[cfg(feature = "cloud-hypervisor")]
@@ -24,6 +27,10 @@ use tracing::info;
 use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 pub use adapters::{LemonadeAdapter, LemonadeConfig, LocalResourceAdapter, NetworkResourceAdapter};
+pub use peer::{PeerIdentity, PeerJob, PeerKind, PeerResult, run_peer_job};
+pub use store::{FabricStoreAdapter, StoreKind, StoreResolution, default_store_resource};
+pub use memory::{ResearchMemoryAdapter, ResearchMemoryReport};
+pub use gpu::wgpu_remote::{WgpuRemoteAdapter, WgpuJob, WgpuResult};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum ResourceKind {
@@ -109,6 +116,9 @@ impl HostInventory {
                 ("available_bytes".into(), disk.available_space().to_string()),
             ]),
         }));
+        resources.push(crate::store::default_store_resource(node.clone()));
+        resources.push(crate::gpu::wgpu_remote::default_resource(node.clone()));
+        resources.push(crate::memory::ResearchMemoryReport::discover().as_resource(node.clone()));
 
         let networks = Networks::new_with_refreshed_list();
         resources.extend(networks.list().iter().map(|(name, network)| Resource {
@@ -196,6 +206,13 @@ pub trait ResourceAdapter: Send + Sync {
 
     fn attach(&self, resource: &Resource, lease: &Lease) -> Result<Attachment, FabricError>;
 
+    /// Undo a successful [`attach`]. Default is a no-op so existing
+    /// adapters stay honest: they never claimed to mutate the host.
+    /// Store/VMM adapters override this so lease release detaches.
+    fn detach(&self, _resource: &Resource, _lease: &Lease) -> Result<(), FabricError> {
+        Ok(())
+    }
+
     /// Reports this adapter's capability scope and current health.
     ///
     /// The default implementation assumes a stateless, always-healthy
@@ -279,6 +296,8 @@ pub struct Fabric {
     resources: RwLock<HashMap<String, Resource>>,
     leases: Mutex<HashMap<String, ActiveLease>>,
     adapters: RwLock<HashMap<String, Arc<dyn ResourceAdapter>>>,
+    /// resource id → adapter that attached it, so [`Self::release`] can detach.
+    attachments: Mutex<HashMap<String, String>>,
     heartbeats: Mutex<HashMap<String, Instant>>,
     next_lease_id: AtomicU64,
 }
@@ -537,10 +556,42 @@ impl Fabric {
             .get(adapter_name)
             .cloned()
             .ok_or(FabricError::AdapterNotFound)?;
-        adapter.attach(&resource, lease)
+        let attachment = adapter.attach(&resource, lease)?;
+        self.attachments
+            .lock()
+            .expect("attachment registry lock poisoned")
+            .insert(lease.resource_id.clone(), adapter_name.into());
+        Ok(attachment)
     }
 
     pub fn release(&self, lease: &Lease) -> Result<(), FabricError> {
+        {
+            let leases = self.leases.lock().expect("lease registry lock poisoned");
+            match leases.get(&lease.resource_id) {
+                Some(active) if active.lease.id == lease.id => {}
+                _ => return Err(FabricError::LeaseNotFound),
+            }
+        }
+
+        let adapter_name = self
+            .attachments
+            .lock()
+            .expect("attachment registry lock poisoned")
+            .remove(&lease.resource_id);
+        if let Some(adapter_name) = adapter_name {
+            if let Some(resource) = self.resource(&lease.resource_id) {
+                if let Some(adapter) = self
+                    .adapters
+                    .read()
+                    .expect("adapter registry lock poisoned")
+                    .get(&adapter_name)
+                    .cloned()
+                {
+                    adapter.detach(&resource, lease)?;
+                }
+            }
+        }
+
         let mut leases = self.leases.lock().expect("lease registry lock poisoned");
         match leases.get(&lease.resource_id) {
             Some(active) if active.lease.id == lease.id => {
@@ -696,6 +747,61 @@ mod tests {
         let resources = HostInventory::discover("test-host");
         assert!(resources.iter().any(|resource| resource.kind == ResourceKind::Cpu));
         assert!(resources.iter().any(|resource| resource.kind == ResourceKind::Memory));
+    }
+
+    #[test]
+    fn host_inventory_includes_fabric_store() {
+        let resources = HostInventory::discover("test-host");
+        let store = resources
+            .iter()
+            .find(|resource| resource.id == "local.store.fabric")
+            .expect("default fabric store advertised");
+        assert_eq!(store.kind, ResourceKind::Storage);
+        assert_eq!(store.exclusive, true);
+        assert_eq!(store.attributes.get("store.kind").map(String::as_str), Some("bind"));
+        assert_eq!(
+            store.attributes.get("store.path").map(String::as_str),
+            Some("/var/lib/nauti/store")
+        );
+    }
+
+    #[test]
+    fn fabric_store_attach_then_release_detaches() {
+        let dir = std::env::temp_dir().join(format!(
+            "nauti-fabric-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let fabric = Fabric::default();
+        let adapter = Arc::new(crate::FabricStoreAdapter::new());
+        fabric.register_adapter(adapter.clone());
+        fabric.register(Resource {
+            id: "store.0".into(),
+            kind: ResourceKind::Storage,
+            capacity: 1,
+            unit: "store".into(),
+            node: "local".into(),
+            state: ResourceState::Available,
+            exclusive: true,
+            attributes: BTreeMap::from([
+                ("store.kind".into(), "bind".into()),
+                ("store.path".into(), dir.display().to_string()),
+                ("store.tag".into(), "nauti".into()),
+            ]),
+        });
+
+        let lease = fabric
+            .lease_exclusive("store.0", "mission-store", Duration::from_secs(30))
+            .unwrap();
+        let attachment = fabric.attach("fabric-store", &lease).unwrap();
+        assert_eq!(attachment.adapter, "fabric-store");
+        assert_eq!(adapter.live_count(), 1);
+        fabric.release(&lease).unwrap();
+        assert_eq!(adapter.live_count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

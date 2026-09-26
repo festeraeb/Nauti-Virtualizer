@@ -9,5 +9,5 @@
 | VMM memory | `allocate_guest_memory` | rust-vmm `vm-memory` | Working allocation |
 | VMM/device lifecycle | Cloud Hypervisor | Upstream executable/API boundary | Planned adapter |
 | Virtio/vhost | rust-vmm / vhost-device | Upstream backends | Planned adapter |
-| Remote fabric | Iroh, QUIC or RDMA | Thin transport abstraction | Not implemented |
-| GPU | NVML/wgpu-remote/VFIO | Capability adapters | Not implemented |
+| Remote fabric | Iroh, QUIC or Tailscale TCP | Agent RPC + wgpu-remote job | Live (Iroh agent; M10 Tailscale) |
+| GPU | NVML/wgpu-remote/VFIO | Capability adapters | wgpu-remote live over Tailscale; VFIO M6 proven earlier |
