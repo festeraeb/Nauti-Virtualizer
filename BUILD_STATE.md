@@ -272,6 +272,54 @@ Declared decision, no silent third option:
 - Hypervisor head remains cesarops2. SFP+ c4↔t440 is a later physical cutover;
   current path is LAN + Tailscale.
 
+## Fleet test + one-fleet deploy — 2026-09-27 (four nodes, SFP+ c4↔t440 live)
+
+- [x] Milestones M0–M10 all closed (M7 PARTIAL superseded by the 2026-09-26
+      live kill-test). Remaining follow-up, not a milestone: in-guest Iroh
+      `agent-serve` needs a jammy-linked nauti (host binary needs GLIBC_2.39).
+- [x] New-hardware adapters (`hwinfo.rs`, sysfs only, always compiled):
+      NIC speed/driver/PCI/NUMA/IPv4, `local.rdma.<dev>.<port>` resources
+      (RoCE / iWARP / IB, state, rate, GID 0, netdev, NUMA), `local.numa.<n>`
+      memory resources, `gpu.numa_node`. `rdma` adapter: lease/attach
+      re-reads sysfs, refuses a port that went DOWN, returns the RoCE v2 GID
+      index + IPv4. RDMA ports are exclusive (leased like GPUs).
+- [x] Hardware seen: t440 BCM57414 25G `rocep1s0f0` ACTIVE (numa0);
+      c4 BCM57414 25G `rocep134s0f0` ACTIVE (numa1) + X722 iWARP `iwo1/iwo2`;
+      c4 4× P100; c3 WX 5100 + RX 570 + i915; c2 P106 + RTX 2060S + GTX 1070.
+- [x] LIVE: t440 → c4 `fabric lease local.rdma.rocep134s0f0.1` → `attach
+      --adapter rdma` (10.0.10.204/24, numa1, gid 5) → `released=true`.
+- [x] `nauti fleet [--json] [--paths]`: every addr file → RPC RTT
+      (min/median/p95), per-path ICMP (25g / lan-10.44 / lan / tailscale),
+      rolled-up inventory. Hub timer `cesarops-nauti-fleet-sync` (t440, 5 min,
+      cesaropsserver `scripts/nauti_fleet_sync.sh`) shares addr files, runs
+      fleet on every node, adds RoCE v2 `ib_write_lat`, writes
+      `/var/lib/nauti/fleet-matrix.json`.
+- [x] One fleet: 4/4 online, 152 cpus, 12 GPUs, 130 GiB VRAM, 4 RDMA ports
+      active. RPC median 0.26–0.7 ms among t440/c2/c4; c3 ~2–3 ms on every
+      path (I218-V NIC on c3, not the fabric). RoCE v2 write t440→c4
+      typical 3.95–4.15 µs, p99 ~6 µs; send 4.62 µs.
+- [x] Tests: `cargo test -p nauti-fabric` 69 + 6 bin;
+      `--features cloud-hypervisor,vhost-user,wgpu-remote,vfio,nvidia` 105 + 6;
+      `--features numa` 68 + 6; workspace green (dataset-validate temp-file
+      race fixed).
+- [x] IOMMU limbo recovery on every node (cesaropsserver
+      `nauti_iommu_repair.py`): known-good ledger, states unbound /
+      fell_off_bus / missing / lost_group, ladder rebind → reset →
+      remove_rescan → escalate (3 consecutive polls, ≤3 steps/hour), GPU
+      monitors paused around nvidia reset/remove. Head = NAUTI_HYPERVISOR_HEAD
+      only (a VM on t440 no longer splits the brain).
+- [x] CPU recovery model on every node: `cesarops-nauti-recovery-model`
+      (Qwen3-0.6B, llama-server `-ngl 0` :13320) + runbook
+      `/var/lib/nauti/iommu-runbook.md`. `--drill` 4/4 on t440, c2, c3, c4.
+      Advice only, never votes.
+- [x] LIVE limbo drill c2 GTX 1070 `0000:0d:00.0`: unbound → polls 1–2 hold →
+      poll 3 rebind (driver still tearing down) → poll 4 reset → healthy,
+      model advice matched every step. Finding: `nauti-daemon` monitors held
+      /dev/nvidia* and made the nvidia unbind spin; the ladder now pauses them.
+- Open: c2 (hypervisor head) boots `iommu=pt` without `intel_iommu=on` →
+  0 IOMMU groups, so VFIO passthrough on c2 is parked (ladder still works at
+  driver level). Cloud Hypervisor only on t440/c2.
+
 ## M5 agent check — CLOSED 2026-09-10
 
 - [x] `nauti fabric` RPC verbs: ping/inventory/find/lease/release drive the

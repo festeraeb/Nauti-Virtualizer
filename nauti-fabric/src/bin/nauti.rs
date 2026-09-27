@@ -123,6 +123,21 @@ enum Command {
         #[command(subcommand)]
         action: ResearchAction,
     },
+    /// One-fleet view: every agent address file in the addr dir, fabric RPC
+    /// latency from this node, per-path ICMP latency, rolled-up resources.
+    Fleet {
+        #[arg(long)]
+        json: bool,
+        /// RPC ping samples per node.
+        #[arg(long, default_value_t = 10)]
+        samples: u32,
+        /// Also time each direct IP path (LAN, 25G/RDMA, Tailscale) with ICMP.
+        #[arg(long)]
+        paths: bool,
+        /// Write the view here (default <addr dir>/fleet-view-<this node>.json).
+        #[arg(long)]
+        out: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -277,6 +292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Adapters { json } => adapters(json),
         Command::Inventory { json, node, refresh } => inventory(&node, json, refresh),
         Command::Demo => demo(),
+        Command::Fleet { json, samples, paths, out } => fleet(json, samples, paths, out),
         Command::AgentServe { node } => agent_serve(&node),
         Command::AgentConnect { addr } => agent_connect(&addr),
         Command::Fabric { action } => fabric_action(action),
@@ -385,6 +401,7 @@ fn adapters(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     fabric.register_adapter(Arc::new(nauti_fabric::FabricStoreAdapter::new()));
     fabric.register_adapter(Arc::new(nauti_fabric::WgpuRemoteAdapter));
     fabric.register_adapter(Arc::new(nauti_fabric::ResearchMemoryAdapter));
+    fabric.register_adapter(Arc::new(nauti_fabric::hwinfo::RdmaAdapter::default()));
     let reports = fabric.adapter_reports();
 
     if json {
@@ -597,6 +614,7 @@ fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
         fabric.register_adapter(Arc::new(nauti_fabric::FabricStoreAdapter::new()));
         fabric.register_adapter(Arc::new(nauti_fabric::WgpuRemoteAdapter));
         fabric.register_adapter(Arc::new(nauti_fabric::ResearchMemoryAdapter));
+        fabric.register_adapter(Arc::new(nauti_fabric::hwinfo::RdmaAdapter::default()));
 
         let (router, addr) = nauti_fabric::rpc::serve(fabric).await?;
         println!("nauti agent listening; endpoint address (paste into agent-connect):");
@@ -1035,6 +1053,264 @@ fn persist_addr_json_to(path: &str, json: &str) -> Result<String, String> {
     Ok(path.to_string())
 }
 
+/// `(node, raw addr JSON)` for every `<node>-addr.json` in the addr dir.
+fn fleet_addr_files() -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let Ok(dir) = std::fs::read_dir(addr_file_dir()) else { return out };
+    for entry in dir.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if let Some(node) = name.strip_suffix("-addr.json") {
+            if let Ok(raw) = std::fs::read_to_string(entry.path()) {
+                out.push((node.to_string(), raw));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Label a direct IP path by its prefix.
+fn path_label(ip: &str) -> Option<&'static str> {
+    if ip.starts_with("10.0.10.") {
+        Some("25g")
+    } else if ip.starts_with("10.44.0.") {
+        Some("lan-10.44")
+    } else if ip.starts_with("192.168.") {
+        Some("lan")
+    } else if ip.starts_with("100.") {
+        Some("tailscale")
+    } else {
+        None
+    }
+}
+
+/// `(min, avg, max)` ms from `ping -q` output.
+fn parse_ping_rtt(output: &str) -> Option<(f64, f64, f64)> {
+    let line = output.lines().find(|l| l.contains("min/avg/max"))?;
+    let nums = line.split('=').nth(1)?.trim().split_whitespace().next()?;
+    let v: Vec<f64> = nums.split('/').filter_map(|n| n.parse().ok()).collect();
+    (v.len() >= 3).then(|| (v[0], v[1], v[2]))
+}
+
+fn icmp_paths(addr: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for item in addr["addrs"].as_array().into_iter().flatten() {
+        let Some(sock) = item["Ip"].as_str() else { continue };
+        let ip = sock.rsplit_once(':').map(|(h, _)| h).unwrap_or(sock).trim_matches(['[', ']']);
+        let Some(label) = path_label(ip) else { continue };
+        if !seen.insert(ip.to_string()) {
+            continue;
+        }
+        let output = std::process::Command::new("ping")
+            .args(["-c", "5", "-i", "0.2", "-W", "1", "-q", ip])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let rtt = parse_ping_rtt(&output);
+        out.push(serde_json::json!({
+            "path": label,
+            "ip": ip,
+            "reachable": rtt.is_some(),
+            "rtt_ms": rtt.map(|(min, avg, max)| serde_json::json!({"min": min, "avg": avg, "max": max})),
+        }));
+    }
+    out
+}
+
+fn percentile(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Roll one node's inventory into the fleet summary shape.
+fn summarize_inventory(resources: &[Resource]) -> serde_json::Value {
+    let attr = |r: &Resource, k: &str| r.attributes.get(k).cloned().unwrap_or_default();
+    let cpus = resources.iter().find(|r| r.id == "local.cpu.logical").map(|r| r.capacity).unwrap_or(0);
+    let memory = resources.iter().find(|r| r.id == "local.memory").map(|r| r.capacity).unwrap_or(0);
+    let gpus: Vec<_> = resources
+        .iter()
+        .filter(|r| r.kind == ResourceKind::Gpu && r.id.starts_with("local.gpu.") && !r.attributes.contains_key("gpu.transport"))
+        .map(|r| serde_json::json!({
+            "id": r.id,
+            "name": attr(r, "gpu.device_name"),
+            "vendor": attr(r, "gpu.vendor"),
+            "driver": attr(r, "gpu.driver"),
+            "pci_bdf": attr(r, "gpu.pci_bdf"),
+            "numa_node": attr(r, "gpu.numa_node"),
+            "vram_bytes": r.capacity,
+        }))
+        .collect();
+    let rdma: Vec<_> = resources
+        .iter()
+        .filter(|r| r.id.starts_with("local.rdma."))
+        .map(|r| serde_json::json!({
+            "device": attr(r, "rdma.device"),
+            "state": attr(r, "rdma.state"),
+            "rate": attr(r, "rdma.rate"),
+            "transport": attr(r, "rdma.transport"),
+            "netdev": attr(r, "rdma.netdev"),
+            "numa_node": attr(r, "rdma.numa_node"),
+        }))
+        .collect();
+    let links: Vec<_> = resources
+        .iter()
+        .filter(|r| r.id.starts_with("local.network.") && !r.attributes.contains_key("net.virtual"))
+        .filter(|r| r.attributes.get("net.operstate").map(|s| s == "up").unwrap_or(false))
+        .map(|r| serde_json::json!({
+            "interface": attr(r, "interface"),
+            "speed_mbps": attr(r, "net.speed_mbps"),
+            "ipv4": attr(r, "net.ipv4"),
+            "rdma_device": attr(r, "net.rdma_device"),
+            "numa_node": attr(r, "net.numa_node"),
+        }))
+        .collect();
+    let numa_nodes = resources.iter().filter(|r| r.id.starts_with("local.numa.")).count();
+    serde_json::json!({
+        "logical_cpus": cpus,
+        "memory_bytes": memory,
+        "numa_nodes": numa_nodes,
+        "gpus": gpus,
+        "rdma_ports": rdma,
+        "links_up": links,
+    })
+}
+
+async fn probe_node(node: String, raw: String, samples: u32, paths: bool) -> serde_json::Value {
+    let addr_value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    let path_timings = if paths {
+        let v = addr_value.clone();
+        tokio::task::spawn_blocking(move || icmp_paths(&v)).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let addr: iroh::EndpointAddr = match serde_json::from_str(&raw) {
+        Ok(a) => a,
+        Err(e) => return serde_json::json!({"node": node, "online": false, "error": format!("bad addr file: {e}"), "paths": path_timings}),
+    };
+    let started = std::time::Instant::now();
+    let connect = tokio::time::timeout(Duration::from_secs(15), AgentClient::connect(addr)).await;
+    let mut client = match connect {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return serde_json::json!({"node": node, "online": false, "error": e.to_string(), "paths": path_timings}),
+        Err(_) => return serde_json::json!({"node": node, "online": false, "error": "connect timeout 15s", "paths": path_timings}),
+    };
+    let connect_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let mut rtts = Vec::new();
+    for _ in 0..samples.max(1) {
+        let t = std::time::Instant::now();
+        match tokio::time::timeout(Duration::from_secs(5), client.call(RpcRequest::Ping)).await {
+            Ok(Ok(RpcResponse::Pong)) => rtts.push(t.elapsed().as_secs_f64() * 1000.0),
+            _ => break,
+        }
+    }
+    rtts.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let inventory = match tokio::time::timeout(Duration::from_secs(10), client.call(RpcRequest::Inventory)).await {
+        Ok(Ok(RpcResponse::Inventory(resources))) => summarize_inventory(&resources),
+        _ => serde_json::Value::Null,
+    };
+    let _ = client.close().await;
+    serde_json::json!({
+        "node": node,
+        "online": !rtts.is_empty(),
+        "connect_ms": connect_ms,
+        "rpc_rtt_ms": {
+            "samples": rtts.len(),
+            "min": rtts.first().copied().unwrap_or(0.0),
+            "median": percentile(&rtts, 0.5),
+            "p95": percentile(&rtts, 0.95),
+            "max": rtts.last().copied().unwrap_or(0.0),
+        },
+        "paths": path_timings,
+        "resources": inventory,
+    })
+}
+
+fn fleet(json: bool, samples: u32, paths: bool, out: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let from = hostname_short();
+    let nodes = runtime.block_on(async {
+        let tasks: Vec<_> = fleet_addr_files()
+            .into_iter()
+            .map(|(node, raw)| tokio::spawn(probe_node(node, raw, samples, paths)))
+            .collect();
+        let mut nodes = Vec::new();
+        for task in tasks {
+            if let Ok(v) = task.await {
+                nodes.push(v);
+            }
+        }
+        nodes
+    });
+    let online: Vec<&serde_json::Value> = nodes.iter().filter(|n| n["online"] == true).collect();
+    let sum = |f: &dyn Fn(&serde_json::Value) -> u64| online.iter().map(|n| f(&n["resources"])).sum::<u64>();
+    let totals = serde_json::json!({
+        "nodes": nodes.len(),
+        "online": online.len(),
+        "logical_cpus": sum(&|r| r["logical_cpus"].as_u64().unwrap_or(0)),
+        "memory_bytes": sum(&|r| r["memory_bytes"].as_u64().unwrap_or(0)),
+        "gpus": sum(&|r| r["gpus"].as_array().map(|a| a.len() as u64).unwrap_or(0)),
+        "vram_bytes": sum(&|r| r["gpus"].as_array().map(|a| a.iter().map(|g| g["vram_bytes"].as_u64().unwrap_or(0)).sum()).unwrap_or(0)),
+        "rdma_ports_active": sum(&|r| r["rdma_ports"].as_array().map(|a| a.iter().filter(|p| p["state"] == "ACTIVE").count() as u64).unwrap_or(0)),
+    });
+    let view = serde_json::json!({
+        "kind": "nauti_fleet_view",
+        "from": from,
+        "generated_at": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        "totals": totals,
+        "nodes": nodes,
+    });
+    let path = out.unwrap_or_else(|| format!("{}/fleet-view-{}.json", addr_file_dir().trim_end_matches('/'), from));
+    if let Err(e) = persist_addr_json_to(&path, &serde_json::to_string_pretty(&view)?) {
+        eprintln!("warning: could not write fleet view: {e}");
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+        return Ok(());
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    println!(
+        "fleet from {from}: {}/{} online | {} cpus | {:.0} GiB ram | {} gpus {:.0} GiB vram | {} rdma ports active",
+        totals["online"], totals["nodes"], totals["logical_cpus"], gib(totals["memory_bytes"].as_u64().unwrap_or(0)),
+        totals["gpus"], gib(totals["vram_bytes"].as_u64().unwrap_or(0)), totals["rdma_ports_active"],
+    );
+    println!("{:<14} {:>6} {:>9} {:>9} {:>9} {:>5} {:>5}  paths", "node", "online", "rpc_min", "rpc_med", "rpc_p95", "gpus", "rdma");
+    for n in &nodes {
+        let r = &n["rpc_rtt_ms"];
+        let res = &n["resources"];
+        let paths: Vec<String> = n["paths"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| match p["rtt_ms"]["avg"].as_f64() {
+                Some(avg) => format!("{}={:.2}ms", p["path"].as_str().unwrap_or("?"), avg),
+                None => format!("{}=down", p["path"].as_str().unwrap_or("?")),
+            })
+            .collect();
+        println!(
+            "{:<14} {:>6} {:>8.2}ms {:>8.2}ms {:>8.2}ms {:>5} {:>5}  {}",
+            n["node"].as_str().unwrap_or("?"),
+            if n["online"] == true { "yes" } else { "NO" },
+            r["min"].as_f64().unwrap_or(0.0),
+            r["median"].as_f64().unwrap_or(0.0),
+            r["p95"].as_f64().unwrap_or(0.0),
+            res["gpus"].as_array().map(|a| a.len()).unwrap_or(0),
+            res["rdma_ports"].as_array().map(|a| a.iter().filter(|p| p["state"] == "ACTIVE").count()).unwrap_or(0),
+            if n["online"] == true { paths.join(" ") } else { n["error"].as_str().unwrap_or("").to_string() },
+        );
+    }
+    Ok(())
+}
+
+fn hostname_short() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().split('.').next().unwrap_or("local").to_string())
+        .unwrap_or_else(|_| "local".into())
+}
+
 fn wgpu_serve(bind: &str) -> Result<(), Box<dyn std::error::Error>> {
     let addr = nauti_fabric::gpu::wgpu_remote::parse_bind(bind)?;
     nauti_fabric::gpu::wgpu_remote::serve(addr).map_err(|e| e.into())
@@ -1071,6 +1347,63 @@ fn research_discover(json: bool) -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ping_rtt_parses_iputils_summary() {
+        let out = "5 packets transmitted, 5 received, 0% packet loss, time 804ms\n\
+                   rtt min/avg/max/mdev = 0.112/0.145/0.201/0.031 ms\n";
+        assert_eq!(parse_ping_rtt(out), Some((0.112, 0.145, 0.201)));
+        assert_eq!(parse_ping_rtt("100% packet loss"), None);
+    }
+
+    #[test]
+    fn path_labels_cover_fleet_prefixes() {
+        assert_eq!(path_label("10.0.10.204"), Some("25g"));
+        assert_eq!(path_label("10.44.0.12"), Some("lan-10.44"));
+        assert_eq!(path_label("192.168.4.29"), Some("lan"));
+        assert_eq!(path_label("100.72.182.77"), Some("tailscale"));
+        assert_eq!(path_label("172.17.0.1"), None);
+        assert_eq!(path_label("64.131.14.25"), None);
+    }
+
+    #[test]
+    fn inventory_summary_counts_gpus_rdma_and_links() {
+        let mk = |id: &str, kind: ResourceKind, cap: u64, attrs: &[(&str, &str)]| Resource {
+            id: id.into(),
+            kind,
+            capacity: cap,
+            unit: "x".into(),
+            node: "n".into(),
+            state: ResourceState::Available,
+            exclusive: false,
+            attributes: attrs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        };
+        let res = vec![
+            mk("local.cpu.logical", ResourceKind::Cpu, 48, &[]),
+            mk("local.memory", ResourceKind::Memory, 64, &[]),
+            mk("local.numa.0", ResourceKind::Memory, 32, &[]),
+            mk("local.numa.1", ResourceKind::Memory, 32, &[]),
+            mk("local.gpu.0000_5e_00_0", ResourceKind::Gpu, 16, &[("gpu.device_name", "P100")]),
+            mk("gpu.virtual.0", ResourceKind::Gpu, 1, &[]),
+            mk("local.gpu.wgpu-remote", ResourceKind::Gpu, 1, &[("gpu.transport", "tailscale")]),
+            mk("local.rdma.rocep1s0f0.1", ResourceKind::Network, 25, &[("rdma.state", "ACTIVE")]),
+            mk("local.network.enp1s0f0np0", ResourceKind::Network, 25, &[("interface", "enp1s0f0np0"), ("net.operstate", "up")]),
+            mk("local.network.docker0", ResourceKind::Network, 0, &[("net.operstate", "up"), ("net.virtual", "true")]),
+        ];
+        let s = summarize_inventory(&res);
+        assert_eq!(s["logical_cpus"], 48);
+        assert_eq!(s["numa_nodes"], 2);
+        assert_eq!(s["gpus"].as_array().unwrap().len(), 1, "virtual proof and wgpu-remote GPUs are not hardware");
+        assert_eq!(s["rdma_ports"].as_array().unwrap().len(), 1);
+        assert_eq!(s["links_up"].as_array().unwrap().len(), 1, "virtual links excluded");
+    }
+
+    #[test]
+    fn percentile_edges() {
+        assert_eq!(percentile(&[], 0.5), 0.0);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0], 0.5), 2.0);
+        assert_eq!(percentile(&[1.0, 2.0, 3.0], 0.95), 3.0);
+    }
 
     #[test]
     fn persist_addr_json_writes_file_and_creates_parents() {

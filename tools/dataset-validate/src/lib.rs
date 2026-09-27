@@ -343,7 +343,9 @@ mod tests {
             std::process::id()
         ));
         fs::create_dir_all(&dir).expect("create tempdir");
-        let path = dir.join("grounding.rs");
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("grounding-{seq}.rs"));
         let body = identifiers
             .iter()
             .map(|id| format!("fn {id}() {{ }}\n"))

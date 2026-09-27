@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod gpu;
+pub mod hwinfo;
 pub mod peer;
 pub mod rpc;
 pub mod rpc_auth;
@@ -311,11 +312,13 @@ impl Fabric {
     }
 
     pub fn discover_local(&self, node: impl Into<String>) -> Vec<Resource> {
-        let mut resources = HostInventory::discover(node);
+        let node = node.into();
+        let mut resources = HostInventory::discover(node.clone());
         // Always discover GPUs via the all-smi adapter (any brand, live).
         if let Ok(discovery) = crate::gpu::GpuDiscoveryResult::discover() {
             resources.extend(discovery.as_resources(self.node_for_resources()));
         }
+        crate::hwinfo::discover_hardware(&node, &mut resources);
         for resource in &resources {
             self.register(resource.clone());
         }
@@ -393,6 +396,7 @@ impl Fabric {
                 info!(?error, "refresh: GPU discovery unavailable, skipping");
             }
         }
+        crate::hwinfo::discover_hardware(&node, &mut new_resources);
 
         let new_ids: std::collections::BTreeSet<String> =
             new_resources.iter().map(|r| r.id.clone()).collect();
