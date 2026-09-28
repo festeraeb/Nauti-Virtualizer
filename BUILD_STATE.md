@@ -239,7 +239,9 @@ Declared decision, no silent third option:
 - [x] Peer may only execute that order. c3 `--repair --ask`:
       `hold / head_reachable_peer_does_not_reboot`, Lemonade `vote=false`.
 - [x] Head `--repair`: `hold / head_alive_no_orphaned_lease` — group count 0
-      this boot is parked (`iommu=pt`, no `intel_iommu=on`), not a reboot.
+      this boot is parked (DMAR table does not parse: `Failed to map dmar0`;
+      `intel_iommu=on` was added and verified 2026-09-28 but the broken DRHD
+      base still blocks VT-d — see the Open item below), not a reboot.
 - [x] Health HTTP `:9106` on LAN `192.168.4.0/22` (ufw opened). Split-brain
       and Lemonade/PXA never reboot.
 - [x] Optional CPU bake-off: c3 Lemonade `Qwen3-14B-GGUF` one completion
@@ -316,9 +318,21 @@ Declared decision, no silent third option:
       poll 3 rebind (driver still tearing down) → poll 4 reset → healthy,
       model advice matched every step. Finding: `nauti-daemon` monitors held
       /dev/nvidia* and made the nvidia unbind spin; the ladder now pauses them.
-- Open: c2 (hypervisor head) boots `iommu=pt` without `intel_iommu=on` →
-  0 IOMMU groups, so VFIO passthrough on c2 is parked (ladder still works at
-  driver level). Cloud Hypervisor only on t440/c2.
+- Open: c2 (hypervisor head) — `intel_iommu=on` **added and verified** 2026-09-28
+  (GRUB updated, clean reboot: flag in `/proc/cmdline`, `DMAR: IOMMU enabled`,
+  3/3 stable ssh, fleet 4/4, no crash loop), but IOMMU groups are still 0
+  because the DMAR table does not parse: `DRHD base 0xf6ffe000 returns all
+  ones` → `Failed to map dmar0` → `Parse DMAR table failure`. The existing
+  `dmar-override.cpio` is byte-identical to the firmware table, so it changes
+  nothing — VFIO stays parked until a *corrected* DMAR override (valid DRHD
+  base for the C600/X79 chipset) or a BIOS fix exists (ladder still works at
+  driver level). Also fixed on c2: `vfio-acs-2060.service` now skips honestly
+  instead of `|| true`-ing a bind that never happened, the stale
+  `10de:15f8` (t440's P100) was dropped from `vfio-pci.ids`, and
+  `cesarops2-strand-rust` was made CPU-only (`-ngl 0`, its 12.1 GiB Q6 model
+  cannot fit any of c2's ≤8 GiB GPUs). Evidence:
+  cesaropsserver `deploy/host-config/README.md`. Cloud Hypervisor only on
+  t440/c2.
 
 ## M5 agent check — CLOSED 2026-09-10
 
