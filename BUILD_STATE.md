@@ -346,3 +346,33 @@ Declared decision, no silent third option:
 - [x] Model prep doc `MODEL_PREP.md` committed.
 - [x] LIVE cross-host proof (t440 -> c2 over QUIC): ping=Pong;
       lease gpu.virtual.0 -> {id:1,…}; release -> released=true.
+
+## M11 — head planner endpoint (OPEN, gated on Fleet F4)
+
+The fabric already carries transport, leases and discovery (M0–M10). What it
+does not yet carry is a place for a node to **ask for a fleet-wide plan**. The
+planner itself is Python and lives in `fleet/`; this milestone is only the
+endpoint and the contract for calling it.
+
+Gate is `fleet/MILESTONES.md` **F4**, which is not yet open. Do not start M11
+before F4 closes — F3 (`escalate()`) defines what makes an ask necessary.
+
+- [ ] `POST /v1/plan` on the head: takes `{node_id, role, local_snapshot}`,
+      returns a plan **fragment** for that node, or `403 escalate-nowhere`.
+      A fragment, not a broadcast: one node asks, one node gets an answer.
+- [ ] Reuses the rRCP validate-and-reject pattern from `RRCP_CONTRACT.md` §4.
+- [ ] Latency matrix from `nauti fleet` feeds the FLEET-scope scoring term.
+- [ ] `FleetPlanner` trait (Fleet F5) has somewhere to live — the head is the
+      natural home for the monolithic implementation, while the federated one
+      needs no head at all.
+
+### Why the head and not every node
+Only the head sees every snapshot merged. A node's local plan cannot know that
+c4 has 12 GiB free *and* that c4's link to t440 is 0.26 ms. That is the whole
+reason F1 (merge) exists. Everything below M11 is transport; this is the first
+milestone that needs fleet-wide truth.
+
+### Check
+A node whose local plan violates a hard constraint receives a fragment naming a
+remote host and the lease it should request. A node whose role is unsatisfiable
+fleet-wide receives `403`. Neither case leaks the head's full plan to the node.
