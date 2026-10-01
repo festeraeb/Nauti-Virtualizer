@@ -201,12 +201,14 @@ impl<L: VfioLauncher + 'static> ResourceAdapter for VfioGpuAdapter<L> {
             });
         }
 
-        // Required attribute: gpu.pci_bus_id. UUID alone is not enough
-        // because the VFIO binding is keyed by BDF.
+        // Required attribute: a PCI address. UUID alone is not enough
+        // because the VFIO binding is keyed by BDF. sysfs discovery sets
+        // gpu.pci_bdf; NVML sets gpu.pci_bus_id with an 8-digit domain.
         let bdf = resource
             .attributes
-            .get("gpu.pci_bus_id")
-            .cloned()
+            .get("gpu.pci_bdf")
+            .or_else(|| resource.attributes.get("gpu.pci_bus_id"))
+            .map(|raw| normalize_bdf(raw))
             .ok_or_else(|| FabricError::MissingResourceAttribute("gpu.pci_bus_id".into()))?;
 
         // Self-discover the host's current state for this BDF.
@@ -325,10 +327,8 @@ impl<L: VfioLauncher + 'static> ResourceAdapter for VfioGpuAdapter<L> {
 // ---------------------------------------------------------------------------
 
 /// Walk `/sys/bus/pci/devices/` and return a `VfioState` for every device
-/// that looks like a GPU. The classification is by PCI class
-/// (0x0300 = display, 0x0302 = 3D) or by vendor (0x10de = NVIDIA,
-/// 0x1002/0x1022 = AMD, 0x8086 = Intel). Conservative: if a device has no
-/// `class` or `vendor` file we leave it out.
+/// that looks like a GPU (PCI base class 0x03). Conservative: a device
+/// with no readable `class` file is left out.
 pub fn discover_vfio_state() -> VfioDiscovery {
     let mut discovery = VfioDiscovery::default();
     let Ok(entries) = std::fs::read_dir("/sys/bus/pci/devices") else {
@@ -353,63 +353,58 @@ pub fn discover_vfio_state() -> VfioDiscovery {
     discovery
 }
 
+/// sysfs BDF form (`0000:03:00.0`, lowercase) from sysfs or NVML
+/// (`00000000:03:00.0`) spellings.
+pub fn normalize_bdf(raw: &str) -> String {
+    let raw = raw.trim().to_ascii_lowercase();
+    match raw.split_once(':') {
+        Some((domain, rest)) if rest.contains(':') => {
+            let domain = u32::from_str_radix(domain, 16).unwrap_or(0);
+            format!("{:04x}:{rest}", domain)
+        }
+        _ => format!("0000:{raw}"),
+    }
+}
+
+fn parse_hex(raw: &str) -> Option<u32> {
+    let raw = raw.trim();
+    u32::from_str_radix(raw.strip_prefix("0x").unwrap_or(raw), 16).ok()
+}
+
+/// PCI base class 0x03 (display: VGA, XGA, 3D). Vendor alone is not a
+/// GPU signal: Intel and AMD also ship NICs, bridges and USB under the
+/// same vendor ids.
 fn is_gpu(device_path: &Path) -> bool {
-    // PCI class 0x0300xx (VGA) or 0x0302xx (3D).
-    if let Some(class_str) = read_first_line(&device_path.join("class")) {
-        if let Some(class_id) = u32::from_str_radix(class_str.get(..6).unwrap_or(""), 16).ok() {
-            let major = (class_id >> 8) & 0xff;
-            if major == 0x03 {
-                return true;
-            }
-        }
-    }
-    // Fall back: vendor 0x10de (NVIDIA), 0x1002 / 0x1022 (AMD), 0x8086 (Intel).
-    if let Some(vendor_str) = read_first_line(&device_path.join("vendor")) {
-        if let Some(vendor) = u32::from_str_radix(vendor_str.get(..4).unwrap_or(""), 16).ok() {
-            if matches!(vendor, 0x10de | 0x1002 | 0x1022 | 0x8086) {
-                return true;
-            }
-        }
-    }
-    false
+    read_first_line(&device_path.join("class"))
+        .and_then(|class| parse_hex(&class))
+        .is_some_and(|class| (class >> 16) & 0xff == 0x03)
 }
 
 fn classify_gpu(device_path: &Path, bdf: &str) -> VfioState {
-    // 1. Is vfio-pci bound? The driver is exposed as a symlink under
-    //    `driver` (when bound) or as a `driver` directory entry reading
-    //    "vfio-pci" (older kernels). Try the symlink first.
-    let driver_link = device_path.join("driver");
-    let bound_to_vfio = std::fs::read_link(&driver_link)
-        .map(|target| {
-            target
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(|s| s == "vfio-pci")
-                .unwrap_or(false)
-        })
+    // A device whose config space reads all-ones has fallen off the bus.
+    if read_first_line(&device_path.join("vendor")).and_then(|v| parse_hex(&v)) == Some(0xffff) {
+        return VfioState::NotPresent { bdf: bdf.to_string() };
+    }
+
+    // 1. IOMMU group first: without one, binding vfio-pci cannot help,
+    //    so report the root cause rather than "not bound".
+    let iommu_group = std::fs::read_link(device_path.join("iommu_group"))
+        .ok()
+        .and_then(|target| target.to_string_lossy().rsplit('/').next().and_then(|n| n.parse::<u32>().ok()));
+    let Some(iommu_group) = iommu_group else {
+        return VfioState::NoIommu { bdf: bdf.to_string() };
+    };
+
+    // 2. Is vfio-pci the bound driver?
+    let bound_to_vfio = std::fs::read_link(device_path.join("driver"))
+        .ok()
+        .and_then(|target| target.file_name().and_then(|n| n.to_str()).map(|s| s == "vfio-pci"))
         .unwrap_or(false);
     if !bound_to_vfio {
         return VfioState::NotBound { bdf: bdf.to_string() };
     }
 
-    // 2. Read the IOMMU group number. The kernel exposes it as a
-    //    symlink to /sys/kernel/iommu_groups/<N>/. Extract N.
-    let iommu_group_link = device_path.join("iommu_group");
-    let iommu_group = match std::fs::read_link(&iommu_group_link) {
-        Ok(target) => {
-            let s = target.to_string_lossy();
-            // Path looks like "../../../kernel/iommu_groups/42".
-            s.rsplit('/').next()
-                .and_then(|n| n.parse::<u32>().ok())
-        }
-        Err(_) => None,
-    };
-    let Some(iommu_group) = iommu_group else {
-        return VfioState::NoIommu { bdf: bdf.to_string() };
-    };
-
-    // 3. Check the /dev/vfio/<N> device file exists. If the group is
-    //    not exposed in userspace, passthrough is not possible.
+    // 3. The group must be exposed to userspace.
     let device_path = PathBuf::from(format!("/dev/vfio/{}", iommu_group));
     if !device_path.exists() {
         return VfioState::NoIommu { bdf: bdf.to_string() };
@@ -476,6 +471,48 @@ mod tests {
 
     fn lease(id: u64) -> Lease {
         Lease { id, resource_id: "local.gpu.x".into(), owner: "test".into() }
+    }
+
+    fn fake_device(name: &str, class: &str, vendor: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("nauti-vfio-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("class"), format!("{class}\n")).unwrap();
+        std::fs::write(dir.join("vendor"), format!("{vendor}\n")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn is_gpu_reads_sysfs_hex_class() {
+        assert!(is_gpu(&fake_device("vga", "0x030000", "0x10de")));
+        assert!(is_gpu(&fake_device("3d", "0x030200", "0x10de")));
+        // Intel NIC: same vendor as the iGPU, not a GPU.
+        assert!(!is_gpu(&fake_device("nic", "0x020000", "0x8086")));
+    }
+
+    #[test]
+    fn classify_reports_missing_iommu_before_binding() {
+        let dev = fake_device("noiommu", "0x030000", "0x10de");
+        assert!(matches!(classify_gpu(&dev, "0000:03:00.0"), VfioState::NoIommu { .. }));
+        let dead = fake_device("dead", "0x030000", "0xffff");
+        assert!(matches!(classify_gpu(&dead, "0000:04:00.0"), VfioState::NotPresent { .. }));
+    }
+
+    #[test]
+    fn normalize_bdf_accepts_nvml_and_short_forms() {
+        assert_eq!(normalize_bdf("00000000:03:00.0"), "0000:03:00.0");
+        assert_eq!(normalize_bdf("0000:3B:00.0"), "0000:3b:00.0");
+        assert_eq!(normalize_bdf("03:00.0"), "0000:03:00.0");
+    }
+
+    #[test]
+    fn attach_accepts_pci_bdf_attribute() {
+        let adapter = VfioGpuAdapter::with_launcher(std::sync::Arc::new(MockVfioLauncher::default()));
+        let mut resource = gpu_resource("ffff:ff:1f.7");
+        resource.attributes.remove("gpu.pci_bus_id");
+        resource.attributes.insert("gpu.pci_bdf".into(), "ffff:ff:1f.7".into());
+        let err = adapter.attach(&resource, &lease(1)).unwrap_err();
+        assert!(matches!(err, FabricError::AdapterBackendUnavailable { .. }), "{err:?}");
     }
 
     #[test]

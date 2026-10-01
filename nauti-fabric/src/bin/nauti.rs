@@ -402,6 +402,11 @@ fn adapters(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     fabric.register_adapter(Arc::new(nauti_fabric::WgpuRemoteAdapter));
     fabric.register_adapter(Arc::new(nauti_fabric::ResearchMemoryAdapter));
     fabric.register_adapter(Arc::new(nauti_fabric::hwinfo::RdmaAdapter::default()));
+    // VfioGpuAdapter lives in `nauti_fabric::vmm`, and `vmm` itself is gated on
+    // `cloud-hypervisor` while the VFIO adapter inside it is gated on `vfio`.
+    // Both must be on, so this is `all(...)` rather than either alone.
+    #[cfg(all(feature = "vfio", feature = "cloud-hypervisor"))]
+    fabric.register_adapter(Arc::new(nauti_fabric::vmm::VfioGpuAdapter::new()));
     let reports = fabric.adapter_reports();
 
     if json {
@@ -615,8 +620,22 @@ fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
         fabric.register_adapter(Arc::new(nauti_fabric::WgpuRemoteAdapter));
         fabric.register_adapter(Arc::new(nauti_fabric::ResearchMemoryAdapter));
         fabric.register_adapter(Arc::new(nauti_fabric::hwinfo::RdmaAdapter::default()));
+        #[cfg(all(feature = "vfio", feature = "cloud-hypervisor"))]
+        fabric.register_adapter(Arc::new(nauti_fabric::vmm::VfioGpuAdapter::new()));
 
-        let (router, addr) = nauti_fabric::rpc::serve(fabric).await?;
+        let secret_key = match load_or_create_agent_key(node) {
+            Ok(key) => Some(key),
+            Err(error) => {
+                println!("warning: agent identity not persisted ({error}); using an ephemeral key");
+                None
+            }
+        };
+        let (router, addr) = nauti_fabric::rpc::serve_with_identity(
+            fabric,
+            Arc::new(nauti_fabric::rpc_auth::NoAuth),
+            secret_key,
+        )
+        .await?;
         println!("nauti agent listening; endpoint address (paste into agent-connect):");
         println!("{}", serde_json::to_string(&addr)?);
         match persist_addr(&node, &addr) {
@@ -1031,6 +1050,38 @@ fn addr_file_dir() -> String {
     std::env::var("NAUTI_AGENT_ADDR_DIR").unwrap_or_else(|_| "/var/lib/nauti".into())
 }
 
+/// Agent identity file: `<dir>/<node>-secret.key` (32 raw bytes, 0600).
+fn agent_key_path(node: &str) -> String {
+    format!("{}/{}-secret.key", addr_file_dir().trim_end_matches('/'), node)
+}
+
+fn load_or_create_agent_key(node: &str) -> Result<iroh::SecretKey, String> {
+    load_or_create_key_at(&agent_key_path(node))
+}
+
+fn load_or_create_key_at(path: &str) -> Result<iroh::SecretKey, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(bytes) = std::fs::read(path) {
+        let raw: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| format!("{path}: expected 32 bytes, found {}", bytes.len()))?;
+        return Ok(iroh::SecretKey::from_bytes(&raw));
+    }
+    let key = iroh::SecretKey::generate();
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("{path}: {e}"))?;
+    std::io::Write::write_all(&mut file, &key.to_bytes()).map_err(|e| format!("{path}: {e}"))?;
+    Ok(key)
+}
+
 /// The address-file path for a node: `<dir>/<node>-addr.json`.
 fn addr_file_path(node: &str) -> String {
     format!("{}/{}-addr.json", addr_file_dir().trim_end_matches('/'), node)
@@ -1403,6 +1454,22 @@ mod tests {
         assert_eq!(percentile(&[], 0.5), 0.0);
         assert_eq!(percentile(&[1.0, 2.0, 3.0], 0.5), 2.0);
         assert_eq!(percentile(&[1.0, 2.0, 3.0], 0.95), 3.0);
+    }
+
+    #[test]
+    fn agent_key_is_created_once_and_reloaded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nauti-key-test-{}", std::process::id()));
+        let path = dir.join("n-secret.key");
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = load_or_create_key_at(path.to_str().unwrap()).unwrap();
+        let second = load_or_create_key_at(path.to_str().unwrap()).unwrap();
+        assert_eq!(first.public(), second.public());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::write(&path, b"short").unwrap();
+        assert!(load_or_create_key_at(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -25,9 +25,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, endpoint::presets};
+use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr, endpoint::presets};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
@@ -247,6 +247,10 @@ impl ProtocolHandler for FabricAgent {
             let request: RpcRequest = match read_frame(&mut recv).await {
                 Ok(request) => request,
                 Err(RpcTransportError::ConnectionClosed) => break,
+                Err(_) if matches!(connection.close_reason(), Some(ConnectionError::ApplicationClosed(_))) => {
+                    info!(%remote_id, "nauti agent: client closed rpc connection");
+                    return Ok(());
+                }
                 Err(error) => return Err(AcceptError::from_err(error)),
             };
             let response = match self.auth.authorize(&ctx, &request) {
@@ -284,7 +288,23 @@ pub async fn serve_with_auth(
     fabric: Arc<Fabric>,
     auth: Arc<dyn AuthProvider>,
 ) -> Result<(Router, EndpointAddr), RpcTransportError> {
-    let endpoint = Endpoint::bind(presets::N0)
+    serve_with_identity(fabric, auth, None).await
+}
+
+/// Like [`serve_with_auth`], with a fixed endpoint identity. A persisted
+/// key keeps the endpoint id (and so every client's address file) stable
+/// across agent restarts; `None` generates a fresh identity.
+pub async fn serve_with_identity(
+    fabric: Arc<Fabric>,
+    auth: Arc<dyn AuthProvider>,
+    secret_key: Option<SecretKey>,
+) -> Result<(Router, EndpointAddr), RpcTransportError> {
+    let mut builder = Endpoint::builder(presets::N0);
+    if let Some(key) = secret_key {
+        builder = builder.secret_key(key);
+    }
+    let endpoint = builder
+        .bind()
         .await
         .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
     endpoint.online().await;
@@ -293,6 +313,36 @@ pub async fn serve_with_auth(
     let agent = FabricAgent::with_auth(fabric, auth, local_endpoint_id);
     let router = Router::builder(endpoint).accept(ALPN, agent).spawn();
     Ok((router, addr))
+}
+
+/// Private / CGNAT (Tailscale) address: reachable without the relay.
+fn is_direct_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 10
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(_) => false,
+    }
+}
+
+/// When the agent advertises a LAN / 25G / Tailscale address, dial only
+/// those: no relay hop, no public-IP or docker-bridge candidates that
+/// just time out. Falls back to the full address set otherwise.
+pub fn prefer_direct(addr: EndpointAddr) -> EndpointAddr {
+    let direct: std::collections::BTreeSet<TransportAddr> = addr
+        .addrs
+        .iter()
+        .filter(|a| matches!(a, TransportAddr::Ip(sock) if is_direct_ip(sock.ip())))
+        .cloned()
+        .collect();
+    if direct.is_empty() {
+        addr
+    } else {
+        EndpointAddr { id: addr.id, addrs: direct }
+    }
 }
 
 /// A connected controller session, able to issue [`RpcRequest`]s against a
@@ -311,7 +361,7 @@ impl AgentClient {
             .await
             .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
         let connection = endpoint
-            .connect(addr, ALPN)
+            .connect(prefer_direct(addr), ALPN)
             .await
             .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
         let (send, recv) = connection
@@ -330,6 +380,9 @@ impl AgentClient {
     /// Gracefully closes the RPC stream and underlying connection/endpoint.
     pub async fn close(mut self) -> Result<(), RpcTransportError> {
         self.send.finish().map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
+        // Let the agent see our EOF and finish its side before we drop the
+        // connection; otherwise it logs every close as "connection lost".
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.recv.read_to_end(64 * 1024)).await;
         self.connection.close(0u32.into(), b"bye");
         self.endpoint.close().await;
         Ok(())

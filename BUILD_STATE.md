@@ -11,15 +11,42 @@ Each milestone closes only when its agent check passes; no skipping ahead.
 ## M0 agent check (must stay true)
 
 - [x] `git status --short` clean on both repos (after this commit)
-- [x] `cargo test -p nauti-fabric` → 44/44 default
-- [x] `cargo test -p nauti-fabric --features rocm` → 48/48
-- [x] `cargo test -p nauti-fabric --features nvidia` → 47/47
-- [x] `cargo test -p nauti-fabric --features cloud-hypervisor` → 56/56
-- [x] `cargo test -p nauti-fabric --features nvidia,cloud-hypervisor` → 59/59
+- [x] `cargo test -p nauti-fabric` → 69/69 default
+- [x] `cargo test -p nauti-fabric --features rocm` → 73/73
+- [x] `cargo test -p nauti-fabric --features nvidia` → 72/72
+- [x] `cargo test -p nauti-fabric --features cloud-hypervisor` → 86/86
+- [x] `cargo test -p nauti-fabric --features nvidia,cloud-hypervisor` → 89/89
+- [x] `cargo test -p nauti-fabric --features vfio` → 69/69
+- [x] `cargo test -p nauti-fabric --features vfio,cloud-hypervisor` → 95/95
 - [x] `cargo test -p dataset-validate` → 12/12 (one flaky failure observed
       2026-09-08, clean on rerun — likely test-order/filesystem race, watch)
 - [x] `cargo test --workspace` (forge-fleet) → 67 passed, 0 failed
 - [x] `cargo build -p nauti-fabric` → zero warnings
+
+### Feature-gate trap (found 2026-10-01, fixed here)
+
+`VfioGpuAdapter` needs **two** features, not one:
+
+- `src/lib.rs` gates `pub mod vmm` on `cloud-hypervisor`
+- `src/vmm/mod.rs` gates `mod vfio` and the `VfioGpuAdapter` re-export on `vfio`
+
+Registering the adapter under `#[cfg(feature = "vfio")]` alone therefore fails
+to compile:
+
+```
+error[E0433]: cannot find `vmm` in `nauti_fabric`
+error: could not compile `nauti-fabric` (bin "nauti" test)
+```
+
+The call sites in `src/bin/nauti.rs` now use
+`#[cfg(all(feature = "vfio", feature = "cloud-hypervisor"))]`.
+
+This matters beyond compilation: the VFIO unit tests
+(`is_gpu_reads_sysfs_hex_class`, `classify_reports_missing_iommu_before_binding`,
+`normalize_bdf_accepts_nvml_and_short_forms`, `attach_accepts_pci_bdf_attribute`)
+only exist under both features, so `--features vfio` alone was never going to
+run them. They run under `vfio,cloud-hypervisor` (95 tests vs 86 for
+cloud-hypervisor alone).
 
 ## M0 triage decisions (this commit)
 
