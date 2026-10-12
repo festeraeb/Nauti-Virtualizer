@@ -1,0 +1,12 @@
+{
+  "_provenance": [
+    "M11 agent-check fixture: the head's role catalogue, transcribed from",
+    "fleet/policy.py FALLBACK_CHAIN, read 2026-10-12. RoleCatalogue reads the",
+    "object KEYS, so the chain order is documentation here, not behaviour.",
+    "A role outside these keys is a typed 404 (bad-enum), never a shrug."
+  ],
+  "thinker": ["thinker", "thinker-nim"],
+  "coder": ["coder-lane-a", "injector"],
+  "reviewer": ["reviewer-c2", "reviewer", "reviewer-e4b", "coder-lane-a"],
+  "translator+reviewer+judge": ["coder-lane-c4", "coder-lane-a"]
+}

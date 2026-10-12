@@ -1,0 +1,61 @@
+{
+  "_provenance": [
+    "M11 agent-check fixture. Slot table transcribed from the head's own",
+    "fleet/policy.py SLOT_BACKENDS + FALLBACK_CHAIN, read 2026-10-12.",
+    "host_key names are the fleet-matrix keys (10.44.0.14 = cesarops4om,",
+    "192.168.4.29 = t440cesarops, 192.168.4.41 = cesarops2).",
+    "free_mb is deliberately ABSENT: SLOT_BACKENDS carries no VRAM figure, so",
+    "every slot defaults to 0.0 and the ranking comes from the measured",
+    "latency matrix alone. No headroom number is invented here.",
+    "Slots the head lists as None (thinker-nim, injector, coder-lane-c4,",
+    "reviewer-t440) are omitted: they are not running, so they cannot serve.",
+    "cesarops2 is locked: c2 was offline in fleet-matrix.json at read time",
+    "(rpc_median_ms nulls) and policy.py marks its reviewer DEGRADED.",
+    "This is a fixture, not a live inventory. Re-transcribe before quoting it."
+  ],
+  "nodes": {
+    "t440cesarops": {
+      "slots": [
+        {
+          "slot": "coder-lane-a",
+          "model_id": "Ornith-1.0-35B-Q4_K_M",
+          "roles": ["coder"],
+          "healthy": true
+        }
+      ]
+    },
+    "cesarops4om": {
+      "slots": [
+        {
+          "slot": "thinker",
+          "model_id": "QwQ-32B-IQ2_XXS",
+          "roles": ["thinker"],
+          "healthy": true
+        },
+        {
+          "slot": "reviewer",
+          "model_id": "Gemma-4-E4B-it-IQ4_XS",
+          "roles": ["reviewer"],
+          "healthy": true
+        },
+        {
+          "slot": "reviewer-e4b",
+          "model_id": "Gemma-4-E4B-it-IQ4_XS",
+          "roles": ["reviewer"],
+          "healthy": true
+        }
+      ]
+    },
+    "cesarops2": {
+      "locked": true,
+      "slots": [
+        {
+          "slot": "reviewer-c2",
+          "model_id": "Gemma-4-26B-MoE-IQ4_XS",
+          "roles": ["reviewer"],
+          "healthy": true
+        }
+      ]
+    }
+  }
+}

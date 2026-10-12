@@ -138,6 +138,66 @@ enum Command {
         #[arg(long)]
         out: Option<String>,
     },
+    /// M11 head planner endpoint: ask the fabric head for a plan FRAGMENT for
+    /// one role, or run the same decision order offline against a committed
+    /// snapshot. One ask, one fragment; an unsatisfiable role is a typed
+    /// `403 escalate-nowhere`, never an empty plan.
+    Plan {
+        #[command(subcommand)]
+        action: PlanAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PlanAction {
+    /// POST /v1/plan to the head and print the fragment (or the typed reject).
+    Ask {
+        /// Role to plan for, e.g. `coder`, `thinker`, `reviewer`.
+        #[arg(long)]
+        role: String,
+        /// Head base URL, e.g. `http://192.168.4.40:8080` (default port 8080).
+        /// Falls back to `$NAUTI_PLAN_HEAD` when omitted.
+        #[arg(long)]
+        head: Option<String>,
+        /// Asking node's host_key (default: this host's short name).
+        #[arg(long)]
+        node: Option<String>,
+        /// Socket timeout in seconds (default 10).
+        #[arg(long, default_value_t = 10)]
+        timeout_secs: u64,
+        /// Emit the fragment (or the reject) as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the head's decision order locally against snapshot JSON. No network,
+    /// no head: this is the agent check on a box where the head is unreachable.
+    Offline {
+        /// Role to plan for.
+        #[arg(long)]
+        role: String,
+        /// Snapshot JSON: a host->slots map (envelope `nodes`/`hosts`/`fleet`
+        /// or bare), as `fleet/planner.py` reads it.
+        #[arg(long)]
+        view: String,
+        /// Asking node's host_key (default: this host's short name).
+        #[arg(long)]
+        node: Option<String>,
+        /// Roles the head knows; a `FALLBACK_CHAIN`-shaped JSON file or a
+        /// comma-separated list. A role outside it is a typed 404.
+        #[arg(long)]
+        roles: String,
+        /// `nauti fleet` latency matrix for the FLEET-scope scoring term
+        /// (`/var/lib/nauti/fleet-matrix.json`). Optional: without it the plan
+        /// scores on headroom alone and says so.
+        #[arg(long)]
+        matrix: Option<String>,
+        /// Planner kind: `monolithic` (fleet-wide) or `federated` (this node).
+        #[arg(long, default_value = "monolithic")]
+        planner: String,
+        /// Emit the fragment (or the reject) as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -293,6 +353,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Inventory { json, node, refresh } => inventory(&node, json, refresh),
         Command::Demo => demo(),
         Command::Fleet { json, samples, paths, out } => fleet(json, samples, paths, out),
+        Command::Plan { action } => plan_action(action),
         Command::AgentServe { node } => agent_serve(&node),
         Command::AgentConnect { addr } => agent_connect(&addr),
         Command::Fabric { action } => fabric_action(action),
@@ -1394,6 +1455,134 @@ fn research_discover(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+/// M11 — one ask, one fragment. Both subcommands print the fragment or the
+/// typed reject and exit non-zero on a reject, so a caller (or a model) cannot
+/// read a refusal as success.
+fn plan_action(action: PlanAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        PlanAction::Ask { role, head, node, timeout_secs, json } => {
+            plan_ask(&role, head, node, timeout_secs, json)
+        }
+        PlanAction::Offline { role, view, node, roles, matrix, planner, json } => {
+            plan_offline(&role, &view, node, &roles, matrix, &planner, json)
+        }
+    }
+}
+
+/// Print a fragment or a typed reject. The reject always shows its rRCP-shaped
+/// reason token and, when the head supplied one, its HTTP status.
+fn report_plan(
+    result: Result<nauti_fabric::plan::PlanFragment, nauti_fabric::plan::PlanReject>,
+    json: bool,
+    planner: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use nauti_fabric::plan::PlanReject;
+    match result {
+        Ok(fragment) => {
+            if json {
+                let mut value = serde_json::to_value(&fragment)?;
+                value["planner"] = serde_json::Value::String(planner.to_string());
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                println!(
+                    "plan fragment role={} host={} slot={} model={}{}",
+                    fragment.role,
+                    fragment.host_key,
+                    fragment.slot,
+                    fragment.model_id,
+                    match fragment.rtt_ms {
+                        Some(ms) => format!(" rtt={ms:.3}ms"),
+                        None => " rtt=not-measured".to_string(),
+                    }
+                );
+                println!("  lease to request: {}", fragment.resource_id.as_deref().unwrap_or("(snapshot named none)"));
+                println!("  reason: {}", fragment.reason);
+                println!("  planner: {planner}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let status = err
+                .http_status()
+                .map(|s| format!("http={s} "))
+                .unwrap_or_default();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "rejected",
+                        "reason": err.reason_token(),
+                        "http_status": err.http_status(),
+                        "detail": err.to_string(),
+                        "planner": planner,
+                    }))?
+                );
+            } else {
+                eprintln!("plan rejected: {status}{}", err);
+                eprintln!("  reason token: {}", err.reason_token());
+                if let PlanReject::EscalateNowhere { .. } = err {
+                    eprintln!("  no host in the fleet can take this role; not an empty plan");
+                }
+            }
+            Err(format!("plan rejected: {}", err.reason_token()).into())
+        }
+    }
+}
+
+fn plan_ask(
+    role: &str,
+    head: Option<String>,
+    node: Option<String>,
+    timeout_secs: u64,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use nauti_fabric::plan::{ask_head_with_timeout, PlanRequest};
+    // No clap `env` feature in this crate, so the fallback is read here.
+    let head = head
+        .or_else(|| std::env::var("NAUTI_PLAN_HEAD").ok())
+        .ok_or("need --head URL or NAUTI_PLAN_HEAD")?;
+    let node_id = node.unwrap_or_else(hostname_short);
+    let req = PlanRequest::new(node_id, role);
+    let result = ask_head_with_timeout(&head, &req, Duration::from_secs(timeout_secs.max(1)));
+    // The head owns the decision; name it as the planner of record.
+    report_plan(result, json, "head:/v1/plan")
+}
+
+fn plan_offline(
+    role: &str,
+    view_path: &str,
+    node: Option<String>,
+    roles_spec: &str,
+    matrix_path: Option<String>,
+    planner_kind: &str,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use nauti_fabric::plan::{FleetView, LatencyMatrix, PlanRequest, RoleCatalogue};
+    let node_id = node.unwrap_or_else(hostname_short);
+    let mut view = FleetView::load_snapshot(std::path::Path::new(view_path))?;
+    if let Some(path) = matrix_path {
+        view = view.with_latency(LatencyMatrix::load(std::path::Path::new(&path))?);
+    }
+    // Roles: a JSON file (array or FALLBACK_CHAIN object) or a comma list.
+    let roles = if let Ok(raw) = std::fs::read_to_string(roles_spec) {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            RoleCatalogue::from_json(&value)
+        } else {
+            RoleCatalogue::new(roles_spec.split(',').map(|s| s.trim().to_string()))
+        }
+    } else {
+        RoleCatalogue::new(roles_spec.split(',').map(|s| s.trim().to_string()))
+    };
+    let req = PlanRequest::new(node_id, role);
+    // `monolithic` runs the head's order (local plan first, then fleet-wide);
+    // `federated` consults only this node and so has no remote step. Either
+    // way a role that cannot be satisfied is a typed 403, never an empty
+    // fragment.
+    let result = nauti_fabric::plan::plan_by_kind(planner_kind, &req, &view, &roles);
+    report_plan(result, json, planner_kind)
+}
+
 
 #[cfg(test)]
 mod tests {

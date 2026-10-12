@@ -374,24 +374,64 @@ Declared decision, no silent third option:
 - [x] LIVE cross-host proof (t440 -> c2 over QUIC): ping=Pong;
       lease gpu.virtual.0 -> {id:1,…}; release -> released=true.
 
-## M11 — head planner endpoint (OPEN, gated on Fleet F4)
+## M11 — head planner endpoint (CLOSED 2026-10-12)
 
 The fabric already carries transport, leases and discovery (M0–M10). What it
-does not yet carry is a place for a node to **ask for a fleet-wide plan**. The
+did not carry was a place for a node to **ask for a fleet-wide plan**. The
 planner itself is Python and lives in `fleet/`; this milestone is only the
 endpoint and the contract for calling it.
 
-Gate is `fleet/MILESTONES.md` **F4**, which is not yet open. Do not start M11
-before F4 closes — F3 (`escalate()`) defines what makes an ask necessary.
+Gate was `fleet/MILESTONES.md` **F4**, which CLOSED 2026-10-04 (`ab917362`,
+`POST /v1/plan` in `fleet/api.py`). F5 (`0bb74ea7`, swappable `FleetPlanner`)
+closed the same day, which is the trait this milestone needed a home for. M11
+was therefore unblocked, and is now closed.
 
-- [ ] `POST /v1/plan` on the head: takes `{node_id, role, local_snapshot}`,
-      returns a plan **fragment** for that node, or `403 escalate-nowhere`.
-      A fragment, not a broadcast: one node asks, one node gets an answer.
-- [ ] Reuses the rRCP validate-and-reject pattern from `RRCP_CONTRACT.md` §4.
-- [ ] Latency matrix from `nauti fleet` feeds the FLEET-scope scoring term.
-- [ ] `FleetPlanner` trait (Fleet F5) has somewhere to live — the head is the
+- [x] `POST /v1/plan` contract on the fabric side: takes
+      `{node_id, role, local_snapshot}`, answers a plan **fragment** for that
+      node, or `403 escalate-nowhere`. A fragment, not a broadcast: one node
+      asks, one node gets an answer.
+- [x] Reuses the rRCP validate-and-reject pattern from `RRCP_CONTRACT.md` §4.
+- [x] Latency matrix from `nauti fleet` feeds the FLEET-scope scoring term.
+- [x] `FleetPlanner` trait (Fleet F5) has somewhere to live — the head is the
       natural home for the monolithic implementation, while the federated one
       needs no head at all.
+
+### What landed
+
+`nauti-fabric/src/plan.rs` (new module, no new dependencies) + `nauti plan`
+CLI + `nauti-fabric/fixtures/m11-*.json`:
+
+- `PlanRequest` / `PlanFragment` are field-for-field with `fleet.api`. The
+  fragment carries two **optional** extensions — `resource_id` (the lease to
+  request, per the agent check) and `rtt_ms` — both
+  `skip_serializing_if = "Option::is_none"`, so the Python response model
+  still parses a Rust fragment and a Python fragment still deserializes here.
+- `PlanReject::reason_token()` follows the §4 rule (machine-stable kebab token,
+  human text after a colon) and reuses §4 tokens where they apply: `bad-enum`
+  (404 unknown role), `missing-field` (422), `backend-down` (unreachable/5xx),
+  `executor-error`. `escalate-nowhere` (403) is deliberately **not** a §4 job
+  token — it is not a job result, and reusing one would make a plan refusal
+  indistinguishable from a failed job. That reasoning is in the module docs.
+- `FleetPlanner` trait with `MonolithicMoEPlanner` (fleet-wide, never returns
+  the asker) and `FederatedPerNodePlanner` (asker only, needs no head);
+  `get_planner()` rejects an unknown kind rather than defaulting. Shared
+  helpers are free functions so the two impls cannot drift — the same reason
+  the Python ABC holds them.
+- `LatencyMatrix` reads the live `/var/lib/nauti/fleet-matrix.json` shape
+  (`rpc_median_ms[from][to]`) or flattens a `nauti_fleet_view`. JSON `null`
+  stays `None` — never 0.0, never invented.
+  `fleet_score = free_mb - LATENCY_MB_PER_MS * rtt_ms` at 512 MiB/ms: a
+  **planning weight, not a measurement**. It only ranks candidates that
+  already satisfy the role; it can never make an unhealthy or locked host
+  eligible. An unmeasured link is scored on headroom alone and the fragment
+  says so (`rtt not measured`).
+- `plan_by_kind()` encodes which decision order a planner kind implies
+  (`monolithic` = the head's local-first then fleet-wide; `federated` = asker
+  only), so the CLI cannot drift from the head by picking a planner and
+  forgetting local-first. That gap was real and was found by running it.
+- The HTTP client is ~120 lines over `std::net::TcpStream` (Content-Length and
+  chunked). The crate ships no HTTP client, and pulling in reqwest/hyper for
+  one endpoint would add a TLS stack to a deliberately dependency-light build.
 
 ### Why the head and not every node
 Only the head sees every snapshot merged. A node's local plan cannot know that
@@ -403,3 +443,86 @@ milestone that needs fleet-wide truth.
 A node whose local plan violates a hard constraint receives a fragment naming a
 remote host and the lease it should request. A node whose role is unsatisfiable
 fleet-wide receives `403`. Neither case leaks the head's full plan to the node.
+
+### M11 evidence (all run 2026-10-12 on t440cesarops)
+
+Test matrix — `CARGO_TARGET_DIR=/data/cargo-target`:
+
+| Command | Result |
+|---|---|
+| `cargo test -p nauti-fabric --no-default-features` | **106 passed, 0 failed** (+ bin 7 passed) |
+| `cargo test -p nauti-fabric --features cloud-hypervisor,vhost-user,wgpu-remote,vfio,nvidia` | **146 passed, 0 failed** (+ bin 7 passed) |
+| `cargo test --workspace` | dataset-validate 12 passed; nauti-fabric 106 passed |
+| `cargo build -p nauti-fabric` | zero warnings |
+
+106 = the 69-test M0 baseline + 37 new `plan::tests`. The M0 baseline is
+untouched: no existing test was edited or removed.
+
+**Live end-to-end against the real Python head.** `fleet.api:app` was started
+by hand (`uvicorn … 127.0.0.1:18080`) and stopped after the run; nothing was
+deployed and no service was left listening.
+
+| Ask | Head answered | `nauti plan ask` produced |
+|---|---|---|
+| `--role coder --node t440cesarops` | `HTTP 403 {"detail":"escalate-nowhere"}` | `escalate-nowhere`, `http=403`, exit 1 |
+| `--role bard` | `HTTP 404 unknown role` | `bad-enum`, `http=404`, exit 1 |
+| `--role reviewer --json` | `HTTP 403` | `{"status":"rejected","reason":"escalate-nowhere","http_status":403}` |
+
+Head-side log for the same asks, i.e. the head really ran its own decision
+order and the Rust client only interpreted the answer:
+
+```
+[fleet.policy] resolve coder: no healthy slot in fallback chain
+[fleet.policy] resolve_remote coder: no healthy remote slot (excl t440cesarops)
+[fleet.api] v1/plan: escalate-nowhere for t440cesarops/coder
+```
+
+**Offline against the real latency matrix.** `nauti plan offline` with
+`--matrix /var/lib/nauti/fleet-matrix.json` (the live hub-written matrix) and
+`nauti-fabric/fixtures/m11-head-slots.json` (transcribed from the head's own
+`SLOT_BACKENDS` / `FALLBACK_CHAIN`, provenance in the file):
+
+| Ask | Fragment |
+|---|---|
+| t440 → `coder` | `host=t440cesarops slot=coder-lane-a model=Ornith-1.0-35B-Q4_K_M` reason `local plan satisfies this role` (local-first) |
+| t440 → `reviewer` | `host=cesarops4om slot=reviewer-e4b model=Gemma-4-E4B-it-IQ4_XS rtt=0.412ms`; locked `cesarops2` never offered |
+| c4 → `coder` | `host=t440cesarops rtt=not-measured` — the live matrix really holds `null` for cesarops4om→t440cesarops and it stayed `None`, not 0.0 |
+| t440 → `translator+reviewer+judge` | `403 escalate-nowhere`, exit 1 (that slot is not running) |
+| c4 → `coder --planner federated` | `403 escalate-nowhere: federated: …` — the extent consulted is named |
+
+### What the live proof did NOT produce
+
+- **A live `200` fragment from the Python head.** Every role 403'd because no
+  slot in `SLOT_BACKENDS` was healthy at 11:12Z (`coder-lane-a`
+  `192.168.4.29:5200` and the c4 backends down). The 200 path is covered by
+  `ask_head_parses_a_live_fragment_and_posts_the_contract`, which serves the
+  exact FastAPI body over a real loopback `TcpListener` and asserts the request
+  line, headers and JSON that arrived — but it has not been seen against the
+  live head with a healthy seat. **Re-run when a seat is up.**
+- **A cross-host ask.** c2 is `NAUTI_HYPERVISOR_HEAD` but refuses `:8080`
+  (`Connection refused`, though the host pings at 2.4–61 ms). The client's
+  behaviour there is the typed `backend-down` above, which is the honest
+  answer, not a proof of the head.
+- `resource_id` (the lease to request) has never been populated by a live
+  snapshot: `SLOT_BACKENDS` carries no fabric resource id, so every live
+  fragment printed `(snapshot named none)`. It is exercised by unit tests only.
+
+### Bug the live proof caught that unit tests could not
+
+`local_snapshot` was serialized as `null`. `fleet.api.PlanRequest` types it
+`dict = Field(default_factory=dict)`, and pydantic applies a default only when
+the key is **absent** — an explicit `null` is rejected with `HTTP 422
+{"type":"dict_type", … "msg":"Input should be a valid dictionary","input":null}`.
+Every ask failed against the real head while all 37 unit tests passed, because
+the test socket does not validate. Fixed with
+`skip_serializing_if = "serde_json::Value::is_null"` and pinned by
+`a_null_snapshot_is_omitted_not_sent_as_null`.
+
+### Flake note (environmental, not this change)
+
+`refresh_local_is_idempotent_on_a_second_call` failed once during the 10:5xZ
+workspace run and passes on rerun (1/1, and 106/106 in every later run). This
+host's `/dev` had been wiped at 21:16Z on 2026-10-11 and was being repopulated
+by `udevadm trigger` while that test ran, so the disk set
+`HostInventory::discover` reads changed between its two refreshes. The test
+reads the real host; it is sensitive to that by construction.

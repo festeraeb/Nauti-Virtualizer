@@ -11,3 +11,4 @@
 | Virtio/vhost | rust-vmm / vhost-device | Upstream backends | Planned adapter |
 | Remote fabric | Iroh, QUIC or Tailscale TCP | Agent RPC + wgpu-remote job | Live (Iroh agent; M10 Tailscale) |
 | GPU | NVML/wgpu-remote/VFIO | Capability adapters | wgpu-remote live over Tailscale; VFIO M6 proven earlier |
+| Fleet plan (M11) | `plan.rs` → head `POST /v1/plan` | `fleet/api.py` (F4) owns the decision; the fabric owns the contract, typed rejects and the latency term | Live against the real head (403/404 mapped typed); a live 200 fragment still pending a healthy seat |

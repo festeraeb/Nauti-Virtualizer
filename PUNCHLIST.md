@@ -103,12 +103,38 @@ only on `100.64.0.0/10` (LAN `192.168.4.x` refused). Live: c3
 `100.76.255.40` → c2 `100.109.55.22:9110`, Vulkan `NVIDIA P106-100`,
 status `ok`, 1561 ms. Not a second GPU scheduler.
 
+## M11 — Head planner endpoint (one ask, one fragment)
+
+The fabric carries transport, leases and discovery. M11 is the first milestone
+that needs fleet-wide truth: only the head sees every snapshot merged, so only
+the head can say "c4 has 12 GiB free *and* is 0.26 ms away". Gate was Fleet
+**F4** (`fleet/MILESTONES.md`), which closed 2026-10-04.
+
+The planner stays Python in `fleet/`. M11 is the endpoint contract for calling
+it, the `FleetPlanner` trait's Rust home, and the latency term — not a second
+scheduler.
+
+Agent check: a node whose local plan violates a hard constraint receives a
+fragment naming a remote host and the lease it should request; a node whose
+role is unsatisfiable fleet-wide receives `403`; neither case leaks the head's
+full plan.
+
+**CLOSED 2026-10-12.** `nauti-fabric/src/plan.rs` + `nauti plan ask|offline` +
+`fixtures/m11-*.json`. 106/106 default (69 baseline + 37 new), 146/146 with
+`cloud-hypervisor,vhost-user,wgpu-remote,vfio,nvidia`, workspace green, zero
+warnings. Live: real `fleet.api:app` head answered `403 escalate-nowhere` and
+`404 unknown role`; the client mapped both to typed rejects with exit 1.
+Offline against the live `fleet-matrix.json`: local-first fragment, remote
+fragment with measured `rtt=0.412ms`, locked host never offered, and an
+unmeasured pair left as `rtt=not-measured` rather than 0.0. Not yet seen: a
+live `200` fragment (no healthy seat at run time) — see BUILD_STATE.md.
+
 ## Build-out order (why this sequence)
 
 Contract (M1) → single truth (M2) → execution without SSH (M3) → policy-governed
 tools (M4) → model-facing shell (M5) → hardware depth (M6–M8) → topology
-freedom (M9) → exotic transports (M10). Each layer only depends on the one below
-it. Skipping ahead recreates the two-fabrics drift.
+freedom (M9) → exotic transports (M10) → fleet-wide planning (M11). Each layer
+only depends on the one below it. Skipping ahead recreates the two-fabrics drift.
 
 CXL/DAX/famfs + DRust stay research throughout — tracked, never claimed.
 **Typed close 2026-09-26:** `nauti research discover` + `memory-research`

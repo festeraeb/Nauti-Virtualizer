@@ -4,6 +4,7 @@ pub mod adapters;
 pub mod gpu;
 pub mod hwinfo;
 pub mod peer;
+pub mod plan;
 pub mod rpc;
 pub mod rpc_auth;
 pub mod config;
@@ -29,6 +30,10 @@ use vm_memory::{GuestAddress, GuestMemoryMmap};
 
 pub use adapters::{LemonadeAdapter, LemonadeConfig, LocalResourceAdapter, NetworkResourceAdapter};
 pub use peer::{PeerIdentity, PeerJob, PeerKind, PeerResult, run_peer_job};
+pub use plan::{
+    FleetPlanner, FleetView, HostView, LatencyMatrix, PlanFragment, PlanReject, PlanRequest,
+    RoleCatalogue, SlotView, ask_head, get_planner, head_plan, plan_by_kind, plan_with,
+};
 pub use store::{FabricStoreAdapter, StoreKind, StoreResolution, default_store_resource};
 pub use memory::{ResearchMemoryAdapter, ResearchMemoryReport};
 pub use gpu::wgpu_remote::{WgpuRemoteAdapter, WgpuJob, WgpuResult};
