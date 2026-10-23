@@ -209,6 +209,10 @@ pub struct LemonadeReport {
     /// Lemonade deployment can be tied to its Vulkan-capable hardware.
     /// Display-only BMC VGA is excluded. Empty on NVIDIA-only hosts.
     pub amd_gpus: Vec<String>,
+    /// Models currently loaded/served by Lemonade, from `status --json`.
+    pub loaded: Vec<LemonadeLoaded>,
+    /// Distinct recipes/backends seen in loaded models.
+    pub backends: Vec<String>,
 }
 
 /// A model Lemonade can serve, tied to a backend (the compute path Lemonade
