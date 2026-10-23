@@ -318,6 +318,12 @@ impl LemonadeAdapter {
                 }
             }
         }
+
+        // Real compute backends (vulkan, cuda, rocm, cpu, metal) from the
+        // health endpoint's launch commands — not recipe names.
+        if let Some(h) = http_get_json(&self.config.host, self.config.port, "/api/v1/health", self.config.api_key.as_deref()) {
+            report.backends = backends_from_health(&h);
+        }
         report
     }
 }
@@ -340,6 +346,38 @@ pub fn parse_status_json(text: &str) -> (Option<String>, Vec<LemonadeLoaded>) {
     }
 }
 
+/// The compute backend (vulkan, cuda, rocm, cpu, metal) a model runs on, taken
+/// from the path segment directly after `llamacpp` in its launch command
+/// (e.g. `.../bin/llamacpp/vulkan/llama-server`; Windows separators too).
+pub fn backend_from_launch_command(entry: &serde_json::Value) -> Option<String> {
+    let cmd = entry.get("launch_command")?.get(0)?.as_str()?;
+    let segments: Vec<&str> = cmd.split(['/', '\\']).collect();
+    for pair in segments.windows(2) {
+        if pair[0] == "llamacpp" {
+            let backend = pair[1].to_lowercase();
+            if matches!(backend.as_str(), "vulkan" | "rocm" | "cpu" | "cuda" | "metal") {
+                return Some(backend);
+            }
+        }
+    }
+    None
+}
+
+/// Distinct backends across `health["all_models_loaded"]`, in order of first
+/// appearance. A missing or non-array field gives an empty Vec.
+pub fn backends_from_health(health: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let items = health.get("all_models_loaded").and_then(|v| v.as_array());
+    for item in items.into_iter().flatten() {
+        if let Some(backend) = backend_from_launch_command(item) {
+            if !out.contains(&backend) {
+                out.push(backend);
+            }
+        }
+    }
+    out
+}
+
 fn run_lemonade(args: &str, base: &str, api_key: Option<&str>) -> Option<String> {
     use std::process::Command;
     let mut cmd = Command::new("lemonade");
@@ -360,6 +398,33 @@ fn run_lemonade(args: &str, base: &str, api_key: Option<&str>) -> Option<String>
             None
         }
     })
+}
+
+/// Minimal std-only HTTP/1.1 GET: the parsed JSON body of a 200 response, or
+/// None on any failure (resolve, connect, timeout, non-200, unparsable body).
+fn http_get_json(host: &str, port: u16, path: &str, api_key: Option<&str>) -> Option<serde_json::Value> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr = (host, port).to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
+
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    if let Some(key) = api_key {
+        request.push_str(&format!("Authorization: Bearer {key}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    if !response.lines().next()?.contains(" 200 ") {
+        return None;
+    }
+    serde_json::from_str(response.split("\r\n\r\n").nth(1)?).ok()
 }
 
 impl ResourceAdapter for LemonadeAdapter {
@@ -514,5 +579,46 @@ mod lemonade_tests {
         let (version, loaded) = parse_status_json("not json");
         assert_eq!(version, None);
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn backend_from_launch_command_reads_the_real_backend() {
+        let entry = serde_json::json!({
+            "model_name": "Phi-3-mini-4k-instruct-Q4_K_M",
+            "recipe": "llamacpp",
+            "device": "gpu",
+            "launch_command": [
+                "/home/cesarops/iced-lemcake/cache/bin/llamacpp/vulkan/llama-server",
+                "-m", "/m.gguf", "--ctx-size", "4096"
+            ]
+        });
+        assert_eq!(backend_from_launch_command(&entry), Some("vulkan".into()));
+    }
+
+    #[test]
+    fn backend_from_launch_command_handles_windows_separators() {
+        let entry = serde_json::json!({
+            "launch_command": ["C:\\Users\\x\\lemonade\\bin\\llamacpp\\rocm\\llama-server.exe"]
+        });
+        assert_eq!(backend_from_launch_command(&entry), Some("rocm".into()));
+    }
+
+    #[test]
+    fn backend_from_launch_command_without_launch_command_is_none() {
+        let entry = serde_json::json!({"model_name": "Phi-3-mini-4k-instruct-Q4_K_M"});
+        assert_eq!(backend_from_launch_command(&entry), None);
+    }
+
+    #[test]
+    fn backends_from_health_distinct_in_first_seen_order() {
+        let entry = |backend: &str| {
+            serde_json::json!({ "launch_command": [format!("/bin/llamacpp/{backend}/llama-server")] })
+        };
+        let both_vulkan = serde_json::json!({ "all_models_loaded": [entry("vulkan"), entry("vulkan")] });
+        assert_eq!(backends_from_health(&both_vulkan), ["vulkan"]);
+        let vulkan_then_cpu = serde_json::json!({ "all_models_loaded": [entry("vulkan"), entry("cpu")] });
+        assert_eq!(backends_from_health(&vulkan_then_cpu), ["vulkan", "cpu"]);
+        let none = serde_json::json!({ "all_models_loaded": [] });
+        assert!(backends_from_health(&none).is_empty());
     }
 }
