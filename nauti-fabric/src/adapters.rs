@@ -1,7 +1,7 @@
 //! Adapters for resources attached on the current host or reached over the fabric network.
 
 use std::collections::BTreeMap;
-use serde_json::{Value, deserialize};
+use serde_json::{Value, from_str};
 
 use crate::{AdapterReport, Attachment, FabricError, Lease, Resource, ResourceAdapter};
 
@@ -225,6 +225,15 @@ pub struct LemonadeModel {
     pub size_gb: Option<f64>,
 }
 
+/// A model currently loaded/served by Lemonade, from `status --json`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LemonadeLoaded {
+    pub id: String,
+    pub recipe: String,
+    pub device: String,
+    pub status: String,
+}
+
 /// A `ResourceAdapter` delegate that surfaces a Lemonade server's capability.
 ///
 /// `attach` only records the lease and reports the Lemonade endpoint; it does
@@ -313,32 +322,19 @@ impl LemonadeAdapter {
 }
 
 pub fn parse_status_json(text: &str) -> (Option<String>, Vec<LemonadeLoaded>) {
-    match deserialize(text) {
+    match from_str(text) {
         Err(_) => (None, vec![]),
         Ok(value) => {
-            let version = match value.get("version") {
-                Some(Value.String(s)) => Some(s),
-                _ => None,
-            };
-            let items = match value.get("models") {
-                Some(Value.Array(items)) => items,
-                _ => vec![],
-            };
+            let version = value.get("version").and_then(|v| v.as_str()).map(str::to_string);
+            let items = value.get("models").and_then(|v| v.as_array()).unwrap_or(vec![]);
             let loaded = items.iter().map(|item| LemonadeLoaded {
-                id: json_string(item.get("model_name")),
-                recipe: json_string(item.get("recipe")),
-                device: json_string(item.get("device")),
-                status: json_string(item.get("status")),
+                id: item.get("model_name").and_then(|v| v.as_str()).unwrap_or_default(),
+                recipe: item.get("recipe").and_then(|v| v.as_str()).unwrap_or_default(),
+                device: item.get("device").and_then(|v| v.as_str()).unwrap_or_default(),
+                status: item.get("status").and_then(|v| v.as_str()).unwrap_or_default(),
             }).collect();
-            (version, loaded);
+            (version, loaded)
         },
-    }
-}
-
-fn json_string(value: Option<Value>) -> String {
-    match value {
-        Some(Value.String(s)) => s,
-        _ => "",
     }
 }
 
@@ -459,7 +455,7 @@ mod lemonade_tests {
                 size_gb: Some(0.36),
             }],
             amd_gpus: vec!["AMD GPU (0000:3b:00.0)".into()],
-            ..Default::default(),
+            ..Default::default()
         };
         assert!(report.reachable);
         assert_eq!(report.version.as_deref(), Some("11.9.0"));
