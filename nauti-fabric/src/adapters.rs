@@ -322,7 +322,7 @@ impl LemonadeAdapter {
 }
 
 pub fn parse_status_json(text: &str) -> (Option<String>, Vec<LemonadeLoaded>) {
-    match from_str(text) {
+    match from_str::<Value>(text) {
         Err(_) => (None, vec![]),
         Ok(value) => {
             let version = value.get("version").and_then(|v| v.as_str()).map(str::to_string);
