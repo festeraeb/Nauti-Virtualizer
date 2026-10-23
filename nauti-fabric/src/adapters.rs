@@ -211,7 +211,8 @@ pub struct LemonadeReport {
     pub amd_gpus: Vec<String>,
     /// Models currently loaded/served by Lemonade, from `status --json`.
     pub loaded: Vec<LemonadeLoaded>,
-    /// Distinct recipes/backends seen in loaded models.
+    /// The compute backends (vulkan, cuda, rocm, cpu, metal) the loaded models run on, as the server reports them
+    /// in its health data. Empty when unknown; never filled with recipe names.
     pub backends: Vec<String>,
 }
 
