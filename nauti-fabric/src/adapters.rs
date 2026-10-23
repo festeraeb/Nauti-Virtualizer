@@ -326,12 +326,13 @@ pub fn parse_status_json(text: &str) -> (Option<String>, Vec<LemonadeLoaded>) {
         Err(_) => (None, vec![]),
         Ok(value) => {
             let version = value.get("version").and_then(|v| v.as_str()).map(str::to_string);
-            let items = value.get("models").and_then(|v| v.as_array()).unwrap_or(vec![]);
+            let empty_models: Vec<Value> = vec![];
+            let items = value.get("models").and_then(|v| v.as_array()).unwrap_or(&empty_models);
             let loaded = items.iter().map(|item| LemonadeLoaded {
-                id: item.get("model_name").and_then(|v| v.as_str()).unwrap_or_default(),
-                recipe: item.get("recipe").and_then(|v| v.as_str()).unwrap_or_default(),
-                device: item.get("device").and_then(|v| v.as_str()).unwrap_or_default(),
-                status: item.get("status").and_then(|v| v.as_str()).unwrap_or_default(),
+                id: item.get("model_name").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default(),
+                recipe: item.get("recipe").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default(),
+                device: item.get("device").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default(),
+                status: item.get("status").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default(),
             }).collect();
             (version, loaded)
         },
