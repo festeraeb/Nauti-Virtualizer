@@ -1,6 +1,7 @@
 //! Adapters for resources attached on the current host or reached over the fabric network.
 
 use std::collections::BTreeMap;
+use serde_json::{Value, deserialize};
 
 use crate::{AdapterReport, Attachment, FabricError, Lease, Resource, ResourceAdapter};
 
@@ -255,16 +256,27 @@ impl LemonadeAdapter {
                 .collect();
         }
 
-        // `lemonade status` — server liveness + version.
+        // `lemonade status --json` — loaded models + version.
+        if let Some(out) = run_lemonade("status --json", &base, self.config.api_key.as_deref()) {
+            let (json_version, loaded) = parse_status_json(&out);
+            report.loaded = loaded;
+            if let Some(version) = json_version {
+                report.version = Some(version);
+            }
+        }
+
+        // `lemonade status` — server liveness + version fallback.
         if let Some(out) = run_lemonade("status", &base, self.config.api_key.as_deref()) {
             report.reachable = out.to_lowercase().contains("running")
                 || out.to_lowercase().contains("server is running");
-            // Version line looks like:  Version   11.9.0
-            report.version = out
-                .lines()
-                .find(|l| l.trim().starts_with("Version"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .map(str::to_string);
+            if report.version.is_none() {
+                // Version line looks like:  Version   11.9.0
+                report.version = out
+                    .lines()
+                    .find(|l| l.trim().starts_with("Version"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .map(str::to_string);
+            }
         }
 
         // `lemonade list --downloaded` — available models. Columns are:
@@ -293,6 +305,36 @@ impl LemonadeAdapter {
             }
         }
         report
+    }
+}
+
+pub fn parse_status_json(text: &str) -> (Option<String>, Vec<LemonadeLoaded>) {
+    match deserialize(text) {
+        Err(_) => (None, vec![]),
+        Ok(value) => {
+            let version = match value.get("version") {
+                Some(Value.String(s)) => Some(s),
+                _ => None,
+            };
+            let items = match value.get("models") {
+                Some(Value.Array(items)) => items,
+                _ => vec![],
+            };
+            let loaded = items.iter().map(|item| LemonadeLoaded {
+                id: json_string(item.get("model_name")),
+                recipe: json_string(item.get("recipe")),
+                device: json_string(item.get("device")),
+                status: json_string(item.get("status")),
+            }).collect();
+            (version, loaded);
+        },
+    }
+}
+
+fn json_string(value: Option<Value>) -> String {
+    match value {
+        Some(Value.String(s)) => s,
+        _ => "",
     }
 }
 
@@ -413,6 +455,7 @@ mod lemonade_tests {
                 size_gb: Some(0.36),
             }],
             amd_gpus: vec!["AMD GPU (0000:3b:00.0)".into()],
+            ..Default::default(),
         };
         assert!(report.reachable);
         assert_eq!(report.version.as_deref(), Some("11.9.0"));
@@ -443,5 +486,31 @@ mod lemonade_tests {
         let attachment = adapter.attach(&resource, &lease).unwrap();
         // reachable should track reality (unreachable port), not claim true.
         assert_eq!(attachment.details["lemonade.reachable"], "false");
+    }
+
+    #[test]
+    fn parse_status_json_live_sample() {
+        let json = r#"{"models":[{"model_name":"Phi-3-mini-4k-instruct-Q4_K_M","recipe":"llamacpp","device":"gpu","status":"ready","type":"llm","checkpoint":"bartowski/Phi-3-mini-4k-instruct-GGUF:Q4_K_M","backend_url":"http://127.0.0.1:8004/v1","pid":3570209,"pinned":false}],"port":13410,"version":"11.9.0","websocket_port":9001}"#;
+        let (version, loaded) = parse_status_json(json);
+        assert_eq!(version.as_deref(), Some("11.9.0"));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "Phi-3-mini-4k-instruct-Q4_K_M");
+        assert_eq!(loaded[0].recipe, "llamacpp");
+        assert_eq!(loaded[0].device, "gpu");
+        assert_eq!(loaded[0].status, "ready");
+    }
+
+    #[test]
+    fn parse_status_json_idle_server() {
+        let (version, loaded) = parse_status_json(r#"{"models":[],"version":"11.9.0"}"#);
+        assert_eq!(version.as_deref(), Some("11.9.0"));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn parse_status_json_invalid() {
+        let (version, loaded) = parse_status_json("not json");
+        assert_eq!(version, None);
+        assert!(loaded.is_empty());
     }
 }
