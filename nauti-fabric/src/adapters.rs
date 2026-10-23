@@ -257,7 +257,7 @@ impl LemonadeAdapter {
     /// Missing/unsuccessful CLI calls are folded into `reachable: false`
     /// rather than panicking.
     pub fn status(&self) -> LemonadeReport {
-        let mut report = LemonadeReport { amd_gpus: Vec::new(), ..Default::default() };
+        let report = LemonadeReport();
         let base = format!("{}:{}", self.config.host, self.config.port);
 
         // AMD Vulkan-capable hardware on this host — all-smi is the
