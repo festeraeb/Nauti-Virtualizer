@@ -427,6 +427,32 @@ fn http_get_json(host: &str, port: u16, path: &str, api_key: Option<&str>) -> Op
     serde_json::from_str(response.split("\r\n\r\n").nth(1)?).ok()
 }
 
+/// The lemonade.* detail keys for attach() and capability_report(). "models" are the
+/// LOADED models; "downloaded" is the `lemonade list` set; "backend" comes only from
+/// the health launch commands (the recipe name "llamacpp" is not a backend).
+pub fn lemonade_detail(report: &LemonadeReport) -> BTreeMap<String, String> {
+    let mut detail = BTreeMap::from([("lemonade.reachable".to_string(), report.reachable.to_string())]);
+    if let Some(version) = &report.version {
+        detail.insert("lemonade.version".into(), version.clone());
+    }
+    let loaded: Vec<&str> = report.loaded.iter().map(|m| m.id.as_str()).collect();
+    detail.insert(
+        "lemonade.models".into(),
+        if loaded.is_empty() { "none-loaded".into() } else { loaded.join(",") },
+    );
+    if !report.models.is_empty() {
+        let ids: Vec<&str> = report.models.iter().map(|m| m.id.as_str()).collect();
+        detail.insert("lemonade.downloaded".into(), ids.join(","));
+    }
+    if !report.backends.is_empty() {
+        detail.insert("lemonade.backend".into(), report.backends.join(","));
+    }
+    if !report.amd_gpus.is_empty() {
+        detail.insert("lemonade.amd_gpus".into(), report.amd_gpus.join("; "));
+    }
+    detail
+}
+
 impl ResourceAdapter for LemonadeAdapter {
     fn name(&self) -> &str {
         "lemonade"
@@ -443,52 +469,16 @@ impl ResourceAdapter for LemonadeAdapter {
             .or_else(|| {
                 Some(format!("{}:{}", self.config.host, self.config.port))
             });
-        let report = self.status();
-        let mut details = BTreeMap::from([
-            ("lemonade.endpoint".into(), endpoint.unwrap_or_default()),
-            ("lemonade.reachable".into(), report.reachable.to_string()),
-            ("attachment.scope".into(), "lemonade-serving".into()),
-        ]);
-        if let Some(version) = &report.version {
-            details.insert("lemonade.version".into(), version.clone());
-        }
-        if !report.models.is_empty() {
-            let ids: Vec<String> = report.models.iter().map(|m| m.id.clone()).collect();
-            details.insert("lemonade.models".into(), ids.join(","));
-        }
-        if let Some(b) = report.models.iter().map(|m| m.backend.as_str()).find(|b| *b != "") {
-            details.insert("lemonade.backend".into(), b.to_string());
-        }
+        let mut details = lemonade_detail(&self.status());
+        details.insert("lemonade.endpoint".into(), endpoint.unwrap_or_default());
+        details.insert("attachment.scope".into(), "lemonade-serving".into());
         Ok(attachment(resource, lease, self.name(), details))
     }
 
     fn capability_report(&self) -> AdapterReport {
         let report = self.status();
-        let mut detail = BTreeMap::from([
-            ("lemonade.endpoint".into(), format!("{}:{}", self.config.host, self.config.port)),
-            (
-                "lemonade.reachable".into(),
-                report.reachable.to_string(),
-            ),
-        ]);
-        if let Some(version) = &report.version {
-            detail.insert("lemonade.version".into(), version.clone());
-        }
-        if report.models.is_empty() {
-            detail.insert("lemonade.models".into(), "none-loaded".into());
-        } else {
-            let ids: Vec<String> = report.models.iter().map(|m| m.id.clone()).collect();
-            detail.insert("lemonade.models".into(), ids.join(","));
-            let backends: Vec<&str> = report
-                .models
-                .iter()
-                .map(|m| m.backend.as_str())
-                .filter(|b| !b.is_empty())
-                .collect();
-            if !backends.is_empty() {
-                detail.insert("lemonade.backend".into(), backends.join(","));
-            }
-        }
+        let mut detail = lemonade_detail(&report);
+        detail.insert("lemonade.endpoint".into(), format!("{}:{}", self.config.host, self.config.port));
         AdapterReport {
             name: self.name().into(),
             scope: "lemonade-serving".into(),
