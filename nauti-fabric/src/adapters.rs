@@ -1,6 +1,7 @@
 //! Adapters for resources attached on the current host or reached over the fabric network.
 
 use std::collections::BTreeMap;
+use serde_json::{Value, from_str};
 
 use crate::{AdapterReport, Attachment, FabricError, Lease, Resource, ResourceAdapter};
 
@@ -208,6 +209,11 @@ pub struct LemonadeReport {
     /// Lemonade deployment can be tied to its Vulkan-capable hardware.
     /// Display-only BMC VGA is excluded. Empty on NVIDIA-only hosts.
     pub amd_gpus: Vec<String>,
+    /// Models currently loaded/served by Lemonade, from `status --json`.
+    pub loaded: Vec<LemonadeLoaded>,
+    /// The compute backends (vulkan, cuda, rocm, cpu, metal) the loaded models run on, as the server reports them
+    /// in its health data. Empty when unknown; never filled with recipe names.
+    pub backends: Vec<String>,
 }
 
 /// A model Lemonade can serve, tied to a backend (the compute path Lemonade
@@ -218,6 +224,15 @@ pub struct LemonadeModel {
     pub backend: String,
     pub downloaded: bool,
     pub size_gb: Option<f64>,
+}
+
+/// A model currently loaded/served by Lemonade, from `status --json`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LemonadeLoaded {
+    pub id: String,
+    pub recipe: String,
+    pub device: String,
+    pub status: String,
 }
 
 /// A `ResourceAdapter` delegate that surfaces a Lemonade server's capability.
@@ -255,16 +270,27 @@ impl LemonadeAdapter {
                 .collect();
         }
 
-        // `lemonade status` — server liveness + version.
+        // `lemonade status --json` — loaded models + version.
+        if let Some(out) = run_lemonade("status --json", &base, self.config.api_key.as_deref()) {
+            let (json_version, loaded) = parse_status_json(&out);
+            report.loaded = loaded;
+            if let Some(version) = json_version {
+                report.version = Some(version);
+            }
+        }
+
+        // `lemonade status` — server liveness + version fallback.
         if let Some(out) = run_lemonade("status", &base, self.config.api_key.as_deref()) {
             report.reachable = out.to_lowercase().contains("running")
                 || out.to_lowercase().contains("server is running");
-            // Version line looks like:  Version   11.9.0
-            report.version = out
-                .lines()
-                .find(|l| l.trim().starts_with("Version"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .map(str::to_string);
+            if report.version.is_none() {
+                // Version line looks like:  Version   11.9.0
+                report.version = out
+                    .lines()
+                    .find(|l| l.trim().starts_with("Version"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .map(str::to_string);
+            }
         }
 
         // `lemonade list --downloaded` — available models. Columns are:
@@ -292,8 +318,64 @@ impl LemonadeAdapter {
                 }
             }
         }
+
+        // Real compute backends (vulkan, cuda, rocm, cpu, metal) from the
+        // health endpoint's launch commands — not recipe names.
+        if let Some(h) = http_get_json(&self.config.host, self.config.port, "/api/v1/health", self.config.api_key.as_deref()) {
+            report.backends = backends_from_health(&h);
+        }
         report
     }
+}
+
+pub fn parse_status_json(text: &str) -> (Option<String>, Vec<LemonadeLoaded>) {
+    match from_str::<Value>(text) {
+        Err(_) => (None, vec![]),
+        Ok(value) => {
+            let version = value.get("version").and_then(|v| v.as_str()).map(str::to_string);
+            let empty_models: Vec<Value> = vec![];
+            let items = value.get("models").and_then(|v| v.as_array()).unwrap_or(&empty_models);
+            let loaded = items.iter().map(|item| LemonadeLoaded {
+                id: item.get("model_name").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default(),
+                recipe: item.get("recipe").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default(),
+                device: item.get("device").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default(),
+                status: item.get("status").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_default(),
+            }).collect();
+            (version, loaded)
+        },
+    }
+}
+
+/// The compute backend (vulkan, cuda, rocm, cpu, metal) a model runs on, taken
+/// from the path segment directly after `llamacpp` in its launch command
+/// (e.g. `.../bin/llamacpp/vulkan/llama-server`; Windows separators too).
+pub fn backend_from_launch_command(entry: &serde_json::Value) -> Option<String> {
+    let cmd = entry.get("launch_command")?.get(0)?.as_str()?;
+    let segments: Vec<&str> = cmd.split(['/', '\\']).collect();
+    for pair in segments.windows(2) {
+        if pair[0] == "llamacpp" {
+            let backend = pair[1].to_lowercase();
+            if matches!(backend.as_str(), "vulkan" | "rocm" | "cpu" | "cuda" | "metal") {
+                return Some(backend);
+            }
+        }
+    }
+    None
+}
+
+/// Distinct backends across `health["all_models_loaded"]`, in order of first
+/// appearance. A missing or non-array field gives an empty Vec.
+pub fn backends_from_health(health: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let items = health.get("all_models_loaded").and_then(|v| v.as_array());
+    for item in items.into_iter().flatten() {
+        if let Some(backend) = backend_from_launch_command(item) {
+            if !out.contains(&backend) {
+                out.push(backend);
+            }
+        }
+    }
+    out
 }
 
 fn run_lemonade(args: &str, base: &str, api_key: Option<&str>) -> Option<String> {
@@ -318,6 +400,59 @@ fn run_lemonade(args: &str, base: &str, api_key: Option<&str>) -> Option<String>
     })
 }
 
+/// Minimal std-only HTTP/1.1 GET: the parsed JSON body of a 200 response, or
+/// None on any failure (resolve, connect, timeout, non-200, unparsable body).
+fn http_get_json(host: &str, port: u16, path: &str, api_key: Option<&str>) -> Option<serde_json::Value> {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
+
+    let addr = (host, port).to_socket_addrs().ok()?.next()?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    stream.set_write_timeout(Some(Duration::from_secs(3))).ok()?;
+
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    if let Some(key) = api_key {
+        request.push_str(&format!("Authorization: Bearer {key}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    if !response.lines().next()?.contains(" 200 ") {
+        return None;
+    }
+    serde_json::from_str(response.split("\r\n\r\n").nth(1)?).ok()
+}
+
+/// The lemonade.* detail keys for attach() and capability_report(). "models" are the
+/// LOADED models; "downloaded" is the `lemonade list` set; "backend" comes only from
+/// the health launch commands (the recipe name "llamacpp" is not a backend).
+pub fn lemonade_detail(report: &LemonadeReport) -> BTreeMap<String, String> {
+    let mut detail = BTreeMap::from([("lemonade.reachable".to_string(), report.reachable.to_string())]);
+    if let Some(version) = &report.version {
+        detail.insert("lemonade.version".into(), version.clone());
+    }
+    let loaded: Vec<&str> = report.loaded.iter().map(|m| m.id.as_str()).collect();
+    detail.insert(
+        "lemonade.models".into(),
+        if loaded.is_empty() { "none-loaded".into() } else { loaded.join(",") },
+    );
+    if !report.models.is_empty() {
+        let ids: Vec<&str> = report.models.iter().map(|m| m.id.as_str()).collect();
+        detail.insert("lemonade.downloaded".into(), ids.join(","));
+    }
+    if !report.backends.is_empty() {
+        detail.insert("lemonade.backend".into(), report.backends.join(","));
+    }
+    if !report.amd_gpus.is_empty() {
+        detail.insert("lemonade.amd_gpus".into(), report.amd_gpus.join("; "));
+    }
+    detail
+}
+
 impl ResourceAdapter for LemonadeAdapter {
     fn name(&self) -> &str {
         "lemonade"
@@ -334,52 +469,16 @@ impl ResourceAdapter for LemonadeAdapter {
             .or_else(|| {
                 Some(format!("{}:{}", self.config.host, self.config.port))
             });
-        let report = self.status();
-        let mut details = BTreeMap::from([
-            ("lemonade.endpoint".into(), endpoint.unwrap_or_default()),
-            ("lemonade.reachable".into(), report.reachable.to_string()),
-            ("attachment.scope".into(), "lemonade-serving".into()),
-        ]);
-        if let Some(version) = &report.version {
-            details.insert("lemonade.version".into(), version.clone());
-        }
-        if !report.models.is_empty() {
-            let ids: Vec<String> = report.models.iter().map(|m| m.id.clone()).collect();
-            details.insert("lemonade.models".into(), ids.join(","));
-        }
-        if let Some(b) = report.models.iter().map(|m| m.backend.as_str()).find(|b| *b != "") {
-            details.insert("lemonade.backend".into(), b.to_string());
-        }
+        let mut details = lemonade_detail(&self.status());
+        details.insert("lemonade.endpoint".into(), endpoint.unwrap_or_default());
+        details.insert("attachment.scope".into(), "lemonade-serving".into());
         Ok(attachment(resource, lease, self.name(), details))
     }
 
     fn capability_report(&self) -> AdapterReport {
         let report = self.status();
-        let mut detail = BTreeMap::from([
-            ("lemonade.endpoint".into(), format!("{}:{}", self.config.host, self.config.port)),
-            (
-                "lemonade.reachable".into(),
-                report.reachable.to_string(),
-            ),
-        ]);
-        if let Some(version) = &report.version {
-            detail.insert("lemonade.version".into(), version.clone());
-        }
-        if report.models.is_empty() {
-            detail.insert("lemonade.models".into(), "none-loaded".into());
-        } else {
-            let ids: Vec<String> = report.models.iter().map(|m| m.id.clone()).collect();
-            detail.insert("lemonade.models".into(), ids.join(","));
-            let backends: Vec<&str> = report
-                .models
-                .iter()
-                .map(|m| m.backend.as_str())
-                .filter(|b| !b.is_empty())
-                .collect();
-            if !backends.is_empty() {
-                detail.insert("lemonade.backend".into(), backends.join(","));
-            }
-        }
+        let mut detail = lemonade_detail(&report);
+        detail.insert("lemonade.endpoint".into(), format!("{}:{}", self.config.host, self.config.port));
         AdapterReport {
             name: self.name().into(),
             scope: "lemonade-serving".into(),
@@ -413,6 +512,7 @@ mod lemonade_tests {
                 size_gb: Some(0.36),
             }],
             amd_gpus: vec!["AMD GPU (0000:3b:00.0)".into()],
+            ..Default::default()
         };
         assert!(report.reachable);
         assert_eq!(report.version.as_deref(), Some("11.9.0"));
@@ -443,5 +543,72 @@ mod lemonade_tests {
         let attachment = adapter.attach(&resource, &lease).unwrap();
         // reachable should track reality (unreachable port), not claim true.
         assert_eq!(attachment.details["lemonade.reachable"], "false");
+    }
+
+    #[test]
+    fn parse_status_json_live_sample() {
+        let json = r#"{"models":[{"model_name":"Phi-3-mini-4k-instruct-Q4_K_M","recipe":"llamacpp","device":"gpu","status":"ready","type":"llm","checkpoint":"bartowski/Phi-3-mini-4k-instruct-GGUF:Q4_K_M","backend_url":"http://127.0.0.1:8004/v1","pid":3570209,"pinned":false}],"port":13410,"version":"11.9.0","websocket_port":9001}"#;
+        let (version, loaded) = parse_status_json(json);
+        assert_eq!(version.as_deref(), Some("11.9.0"));
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "Phi-3-mini-4k-instruct-Q4_K_M");
+        assert_eq!(loaded[0].recipe, "llamacpp");
+        assert_eq!(loaded[0].device, "gpu");
+        assert_eq!(loaded[0].status, "ready");
+    }
+
+    #[test]
+    fn parse_status_json_idle_server() {
+        let (version, loaded) = parse_status_json(r#"{"models":[],"version":"11.9.0"}"#);
+        assert_eq!(version.as_deref(), Some("11.9.0"));
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn parse_status_json_invalid() {
+        let (version, loaded) = parse_status_json("not json");
+        assert_eq!(version, None);
+        assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn backend_from_launch_command_reads_the_real_backend() {
+        let entry = serde_json::json!({
+            "model_name": "Phi-3-mini-4k-instruct-Q4_K_M",
+            "recipe": "llamacpp",
+            "device": "gpu",
+            "launch_command": [
+                "/home/cesarops/iced-lemcake/cache/bin/llamacpp/vulkan/llama-server",
+                "-m", "/m.gguf", "--ctx-size", "4096"
+            ]
+        });
+        assert_eq!(backend_from_launch_command(&entry), Some("vulkan".into()));
+    }
+
+    #[test]
+    fn backend_from_launch_command_handles_windows_separators() {
+        let entry = serde_json::json!({
+            "launch_command": ["C:\\Users\\x\\lemonade\\bin\\llamacpp\\rocm\\llama-server.exe"]
+        });
+        assert_eq!(backend_from_launch_command(&entry), Some("rocm".into()));
+    }
+
+    #[test]
+    fn backend_from_launch_command_without_launch_command_is_none() {
+        let entry = serde_json::json!({"model_name": "Phi-3-mini-4k-instruct-Q4_K_M"});
+        assert_eq!(backend_from_launch_command(&entry), None);
+    }
+
+    #[test]
+    fn backends_from_health_distinct_in_first_seen_order() {
+        let entry = |backend: &str| {
+            serde_json::json!({ "launch_command": [format!("/bin/llamacpp/{backend}/llama-server")] })
+        };
+        let both_vulkan = serde_json::json!({ "all_models_loaded": [entry("vulkan"), entry("vulkan")] });
+        assert_eq!(backends_from_health(&both_vulkan), ["vulkan"]);
+        let vulkan_then_cpu = serde_json::json!({ "all_models_loaded": [entry("vulkan"), entry("cpu")] });
+        assert_eq!(backends_from_health(&vulkan_then_cpu), ["vulkan", "cpu"]);
+        let none = serde_json::json!({ "all_models_loaded": [] });
+        assert!(backends_from_health(&none).is_empty());
     }
 }
