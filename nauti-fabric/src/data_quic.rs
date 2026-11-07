@@ -137,16 +137,10 @@ impl DataServer {
                     }
                 }
                 DataRequest::RdmaHello { file, offset, len, qp } => {
-                    let reply = self.rdma_hello(&file, offset, len, &qp, {
-                        #[cfg(feature = "rdma")]
-                        {
-                            &mut windows
-                        }
-                        #[cfg(not(feature = "rdma"))]
-                        {
-                            &mut ()
-                        }
-                    });
+                    #[cfg(feature = "rdma")]
+                    let reply = self.rdma_hello(&file, offset, len, &qp, &mut windows);
+                    #[cfg(not(feature = "rdma"))]
+                    let reply = self.rdma_hello(&file, offset, len, &qp);
                     write_frame(send, &reply).await?;
                 }
             }
@@ -182,7 +176,7 @@ impl DataServer {
     }
 
     #[cfg(not(feature = "rdma"))]
-    fn rdma_hello(&self, _file: &str, _offset: u64, _len: u64, _qp: &QpInfo, _w: &mut ()) -> DataResponse {
+    fn rdma_hello(&self, _file: &str, _offset: u64, _len: u64, _qp: &QpInfo) -> DataResponse {
         let _ = &self.rdma;
         DataResponse::Error { reason: "this nauti was built without the rdma feature".into() }
     }
