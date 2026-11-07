@@ -2324,9 +2324,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "cc",
  "clap",
  "hwlocality",
  "iroh",
+ "libc",
  "nvml-wrapper",
  "pollster",
  "serde",
