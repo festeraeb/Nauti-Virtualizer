@@ -9,6 +9,10 @@ pub mod rpc;
 pub mod rpc_auth;
 pub mod config;
 pub mod store;
+pub mod data;
+pub mod data_quic;
+#[cfg(feature = "rdma")]
+pub mod rdma;
 pub mod memory;
 #[cfg(feature = "numa")]
 pub mod topology;

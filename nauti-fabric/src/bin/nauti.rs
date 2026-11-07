@@ -66,6 +66,61 @@ enum Command {
         /// JSON-encoded `EndpointAddr` printed by `agent-serve`.
         addr: String,
     },
+    /// Serve a directory's files by range over the data protocol: Iroh/QUIC (the fabric's transport) and, with
+    /// --tcp, plain TCP with the same frames. With --rdma, a peer's RdmaHello gets an RDMA READ window of a file
+    /// on that RoCE port. The address file is <addr dir>/<node>-data-addr.json.
+    DataServe {
+        #[arg(long)]
+        root: std::path::PathBuf,
+        #[arg(long, default_value = "local")]
+        node: String,
+        /// Also listen for the same frames on this TCP address, e.g. 0.0.0.0:7801.
+        #[arg(long)]
+        tcp: Option<std::net::SocketAddr>,
+        /// RoCE port for RDMA windows: device:port:gid_index, e.g. rocep1s0f1:1:5 (needs the rdma feature).
+        #[arg(long)]
+        rdma: Option<String>,
+    },
+    /// Measure one data path on scattered chunks of a file, the same chunks for every path: nfs-mmap (a local
+    /// path, through this host's NFS mount), quic, quic-relay, tcp, roce. Prints a table row, or JSON.
+    DataBench {
+        /// nfs-mmap | quic | quic-relay | tcp | roce
+        #[arg(long)]
+        path: String,
+        /// For nfs-mmap: the file's local path. Otherwise: its name under the server's root.
+        #[arg(long)]
+        file: String,
+        /// The server's EndpointAddr JSON, or @path of its address file (quic, quic-relay, roce).
+        #[arg(long)]
+        addr: Option<String>,
+        /// The server's TCP address (tcp).
+        #[arg(long)]
+        tcp: Option<std::net::SocketAddr>,
+        /// Bytes a chunk: 24K, 23M, 256M ...
+        #[arg(long, default_value = "23M")]
+        chunk: String,
+        #[arg(long, default_value_t = 200)]
+        count: usize,
+        /// The chunks come from [window_offset, window_offset + window_len) of the file; the window defaults to
+        /// the rest of the file (roce: at most 4 GiB, as it is registered).
+        #[arg(long, default_value_t = 0)]
+        window_offset: u64,
+        #[arg(long)]
+        window_len: Option<u64>,
+        /// nfs-mmap: forget each chunk on this host right before reading it, so every read goes to the server.
+        #[arg(long)]
+        cold: bool,
+        /// This side's RoCE port, device:port:gid_index (roce).
+        #[arg(long)]
+        rdma: Option<String>,
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+        /// Repeat the whole set this many times (the first round warms caches the path has).
+        #[arg(long, default_value_t = 1)]
+        rounds: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// Drive a remote fabric agent over the RPC contract — the verbs an
     /// LLM-facing tool layer (MCP) calls. `addr` is the JSON-encoded
     /// `EndpointAddr` the agent printed at startup and self-registered to
@@ -356,6 +411,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Plan { action } => plan_action(action),
         Command::AgentServe { node } => agent_serve(&node),
         Command::AgentConnect { addr } => agent_connect(&addr),
+        Command::DataServe { root, node, tcp, rdma } => data_serve(root, &node, tcp, rdma),
+        Command::DataBench { path, file, addr, tcp, chunk, count, window_offset, window_len, cold, rdma, seed, rounds, json } => {
+            data_bench(&path, &file, addr, tcp, &chunk, count, window_offset, window_len, cold, rdma, seed, rounds, json)
+        }
         Command::Fabric { action } => fabric_action(action),
         #[cfg(feature = "numa")]
         Command::Topology { json } => topology(json),
@@ -709,6 +768,162 @@ fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
         router.shutdown().await.map_err(|error| format!("router shutdown failed: {error}"))?;
         Ok::<_, Box<dyn std::error::Error>>(())
     })
+}
+
+/// Serves files by range over Iroh/QUIC and TCP (data_quic), for engines on other nodes and for data-bench.
+fn data_serve(
+    root: std::path::PathBuf,
+    node: &str,
+    tcp: Option<std::net::SocketAddr>,
+    rdma: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+    let rdma = match rdma {
+        Some(spec) => {
+            #[cfg(feature = "rdma")]
+            {
+                Some(nauti_fabric::rdma::parse_rdma_spec(&spec)?)
+            }
+            #[cfg(not(feature = "rdma"))]
+            {
+                return Err(format!("--rdma {spec}: this nauti was built without the rdma feature").into());
+            }
+        }
+        None => None,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    runtime.block_on(async move {
+        let server = Arc::new(nauti_fabric::data_quic::DataServer::new(root.clone(), rdma.clone()));
+        let (router, addr) = nauti_fabric::data_quic::serve_quic(server.clone(), None).await?;
+        println!("nauti data server: {} over QUIC; endpoint address:", root.display());
+        println!("{}", serde_json::to_string(&addr)?);
+        let path = format!("{}/{node}-data-addr.json", addr_file_dir());
+        match persist_addr_json_to(&path, &serde_json::to_string_pretty(&addr)?) {
+            Ok(path) => println!("address file: {path}"),
+            Err(error) => println!("warning: could not persist address file: {error}"),
+        }
+        if let Some((dev, port, gid)) = &rdma {
+            println!("RDMA windows on {dev} port {port}, gid index {gid}");
+        }
+        let tcp_task = tcp.map(|listen| {
+            println!("the same frames over TCP on {listen}");
+            tokio::spawn(nauti_fabric::data_quic::serve_tcp(server.clone(), listen))
+        });
+        println!("press ctrl-c to stop");
+        tokio::signal::ctrl_c().await?;
+        if let Some(t) = tcp_task {
+            t.abort();
+        }
+        router.shutdown().await.map_err(|error| format!("router shutdown failed: {error}"))?;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })
+}
+
+/// A server address from the CLI: JSON, or @path to an address file.
+fn endpoint_addr_arg(addr: &str) -> Result<iroh::EndpointAddr, Box<dyn std::error::Error>> {
+    let json = match addr.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?,
+        None => addr.to_string(),
+    };
+    Ok(serde_json::from_str(&json)?)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn data_bench(
+    path: &str,
+    file: &str,
+    addr: Option<String>,
+    tcp: Option<std::net::SocketAddr>,
+    chunk: &str,
+    count: usize,
+    window_offset: u64,
+    window_len: Option<u64>,
+    cold: bool,
+    rdma: Option<String>,
+    seed: u64,
+    rounds: usize,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use nauti_fabric::data::{ChunkSource, MappedFile, bench, parse_size, scattered_offsets};
+    use nauti_fabric::data_quic::{QuicChunkSource, TcpChunkSource};
+    let chunk = parse_size(chunk).ok_or_else(|| format!("--chunk {chunk}: a size like 24K or 23M"))?;
+    let addr_of = |what: &str| -> Result<iroh::EndpointAddr, Box<dyn std::error::Error>> {
+        endpoint_addr_arg(addr.as_deref().ok_or_else(|| format!("--path {what} needs --addr"))?)
+    };
+    // the file's size, by the path's own means, then the window
+    let (mut src, size): (Box<dyn ChunkSource>, u64) = match path {
+        "nfs-mmap" | "mmap" => {
+            let m = MappedFile::open(file)?;
+            let size = m.len();
+            (Box::new(m), size)
+        }
+        "quic" | "quic-relay" => {
+            let mut c = QuicChunkSource::connect(addr_of(path)?, path == "quic-relay", file)?;
+            let size = c.stat()?;
+            (Box::new(c), size)
+        }
+        "tcp" => {
+            let mut c = TcpChunkSource::connect(tcp.ok_or("--path tcp needs --tcp HOST:PORT")?, file)?;
+            let size = c.stat()?;
+            (Box::new(c), size)
+        }
+        "roce" => {
+            #[cfg(feature = "rdma")]
+            {
+                let spec = rdma.as_deref().ok_or("--path roce needs --rdma device:port:gid_index")?;
+                let a = addr_of(path)?;
+                let size = QuicChunkSource::connect(a.clone(), false, file)?.stat()?;
+                let rest = size.saturating_sub(window_offset);
+                let len = window_len.unwrap_or(rest.min(4 << 30)).min(rest);
+                let c = nauti_fabric::data_quic::RdmaChunkSource::connect(a, file, spec, window_offset, len)?;
+                (Box::new(c), size)
+            }
+            #[cfg(not(feature = "rdma"))]
+            {
+                let _ = &rdma;
+                return Err("--path roce: this nauti was built without the rdma feature".into());
+            }
+        }
+        other => return Err(format!("--path {other}: nfs-mmap, quic, quic-relay, tcp or roce").into()),
+    };
+    if window_offset >= size {
+        return Err(format!("--window-offset {window_offset} is past the file ({size} bytes)").into());
+    }
+    let mut len = window_len.unwrap_or(size - window_offset).min(size - window_offset);
+    if path == "roce" {
+        len = len.min(4 << 30);
+    }
+    if (chunk as u64) > len {
+        return Err(format!("a {chunk}-byte chunk does not fit the {len}-byte window").into());
+    }
+    let offsets = scattered_offsets(window_offset, len, chunk as u64, count, seed);
+    if !json {
+        println!(
+            "{:<58} {:>7} {:>5} {:>4} {:>9} {:>9} {:>9} {:>9} {:>8}  checksum",
+            "path", "chunk", "n", "cold", "p50 ms", "p95 ms", "p99 ms", "mean ms", "MB/s"
+        );
+    }
+    for _ in 0..rounds {
+        let r = bench(src.as_mut(), &offsets, chunk, cold)?;
+        if json {
+            println!("{}", serde_json::to_string(&r)?);
+        } else {
+            println!(
+                "{:<58} {:>7} {:>5} {:>4} {:>9.3} {:>9.3} {:>9.3} {:>9.3} {:>8.1}  {:016x}",
+                r.path.chars().take(58).collect::<String>(),
+                chunk,
+                r.count,
+                if r.cold { "yes" } else { "no" },
+                r.p50_us / 1e3,
+                r.p95_us / 1e3,
+                r.p99_us / 1e3,
+                r.mean_us / 1e3,
+                r.mb_s,
+                r.checksum
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Connects to a remote fabric agent and runs the two-process lease/attach/

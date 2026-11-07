@@ -141,7 +141,7 @@ pub enum RpcTransportError {
     Iroh(String),
 }
 
-async fn write_frame<W: AsyncWriteExt + Unpin>(
+pub(crate) async fn write_frame<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     value: &impl Serialize,
 ) -> Result<(), RpcTransportError> {
@@ -152,7 +152,7 @@ async fn write_frame<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(
+pub(crate) async fn read_frame<R: AsyncReadExt + Unpin, T: for<'de> Deserialize<'de>>(
     reader: &mut R,
 ) -> Result<T, RpcTransportError> {
     let mut len_bytes = [0u8; 4];
