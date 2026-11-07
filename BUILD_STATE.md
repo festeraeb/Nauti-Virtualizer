@@ -526,3 +526,32 @@ host's `/dev` had been wiped at 21:16Z on 2026-10-11 and was being repopulated
 by `udevadm trigger` while that test ran, so the disk set
 `HostInventory::discover` reads changed between its two refreshes. The test
 reads the real host; it is sensitive to that by construction.
+
+## M12 — data paths off the control link — CLOSED in code 2026-11-07, measured live
+
+- [x] `nauti-fabric/src/data.rs`: `MappedFile` (read-only mmap: range read, WILLNEED, forget =
+      DONTNEED + fadvise so a client measurement is cold again), `NfsMmapAdapter` (attaches a leased
+      `store.nfs_export` to this host's mount of it, maps `data.file`, reports mount options and a
+      measured first-page read; an unmounted export is a reported failure), `ChunkSource` + `bench()`
+      (p50/p95/p99/mean, MB/s, FNV checksum so every path provably read the same bytes).
+- [x] `src/data_quic.rs`: data protocol `nauti-fabric/data/1` (Stat / Get{file, offset, len} /
+      RdmaHello) over Iroh/QUIC (direct or relay-only) and plain TCP, the same frames. RdmaHello is
+      the control message of the RoCE path: queue-pair numbers and the registered window.
+- [x] `src/rdma.rs` + `csrc/rdma_shim.c` (feature `rdma`, build.rs + cc, links libibverbs): one RC
+      queue pair per handle; the server registers a window of its mapped model file (remote read),
+      the client RDMA READs straight into its own buffer. No copy on either side.
+- [x] CLI: `nauti data-serve --root DIR [--tcp A:P] [--rdma dev:port:gid]`,
+      `nauti data-bench --path nfs-mmap|quic|quic-relay|tcp|roce ...`.
+- [x] LIVE c4 -> t440 (BCM57414 25 GbE, RoCE v2 gid 5 -> 3, t440 page cache hot; Le Chonk shard 2
+      chunks; checksums equal on every path):
+      | path | 24 KiB p50 | 23 MiB p50, MB/s | 256 MiB MB/s |
+      | roce | 19 us | 8.4 ms, 2,840 | 2,865 |
+      | nfs-mmap cold | 1.5 ms | 18.2 ms, 1,313 | 2,148 |
+      | tcp | 0.63 ms | 23.5 ms, 981 | 1,160 |
+      | quic (Iroh 1.1) | 0.89 ms | 207 ms, 120 | 119 |
+      perftest ceilings: ib_read_bw 2,843 MB/s, ib_read_lat 24 KiB 18.0 us. RoCE runs at the ceiling;
+      the Iroh stream carries bulk bytes at 120 MB/s, 8x under TCP, which is TRANSPORT_ANALYSIS's
+      point measured. Relay-only could not be held (iroh upgraded to the direct path).
+- [ ] GPU-memory RDMA target (nvidia-peermem on c4; needs the CUDA runtime in the client).
+- [ ] The engine (strata-poly) using this path for expert misses; the shim is the calls it needs.
+- Tests: `cargo test -p nauti-fabric` 123 + 7 + 4; `--features rdma` 124 + 7 + 4.
