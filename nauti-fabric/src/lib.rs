@@ -7,6 +7,7 @@ pub mod peer;
 pub mod plan;
 pub mod rpc;
 pub mod rpc_auth;
+pub mod registry;
 pub mod config;
 pub mod store;
 pub mod data;

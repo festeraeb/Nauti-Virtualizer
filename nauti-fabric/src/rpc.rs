@@ -357,7 +357,22 @@ pub struct AgentClient {
 impl AgentClient {
     /// Connects to a remote fabric agent advertised at `addr`.
     pub async fn connect(addr: EndpointAddr) -> Result<Self, RpcTransportError> {
-        let endpoint = Endpoint::bind(presets::N0)
+        Self::connect_with_identity(addr, None).await
+    }
+
+    /// Like [`connect`](Self::connect), but presents a persistent Ed25519
+    /// identity, so a server running a trust registry can recognise (and
+    /// accept) this client. `None` uses a fresh identity per call.
+    pub async fn connect_with_identity(
+        addr: EndpointAddr,
+        secret_key: Option<SecretKey>,
+    ) -> Result<Self, RpcTransportError> {
+        let mut builder = Endpoint::builder(presets::N0);
+        if let Some(key) = secret_key {
+            builder = builder.secret_key(key);
+        }
+        let endpoint = builder
+            .bind()
             .await
             .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
         let connection = endpoint

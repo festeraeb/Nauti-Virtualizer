@@ -60,11 +60,34 @@ enum Command {
     AgentServe {
         #[arg(long, default_value = "local")]
         node: String,
+        /// Trust stack: none (home), nexus, or virtualizer. Default: the
+        /// `trust_provider` stored in the registry file, else none.
+        #[arg(long)]
+        trust: Option<String>,
+        /// Registry file (default: $NAUTI_REGISTRY or ~/.config/nauti/registry.json).
+        #[arg(long)]
+        registry: Option<std::path::PathBuf>,
+        /// Use this 32-byte Ed25519 seed file as the agent identity instead of
+        /// the per-node key, so the agent shares an identity with another stack.
+        #[arg(long)]
+        key_file: Option<std::path::PathBuf>,
+    },
+    /// Trust registry: which servers are accepted, and which trust stack runs.
+    Trust {
+        /// Registry file (default: $NAUTI_REGISTRY or ~/.config/nauti/registry.json).
+        #[arg(long, global = true)]
+        registry: Option<std::path::PathBuf>,
+        #[command(subcommand)]
+        action: TrustAction,
     },
     /// Connect to a remote fabric agent and run the two-process lease/attach/release proof.
     AgentConnect {
         /// JSON-encoded `EndpointAddr` printed by `agent-serve`.
         addr: String,
+        /// 32-byte Ed25519 seed file to present as this client's identity
+        /// (created if missing). Default: a fresh identity per run.
+        #[arg(long)]
+        key_file: Option<std::path::PathBuf>,
     },
     /// Serve a directory's files by range over the data protocol: Iroh/QUIC (the fabric's transport) and, with
     /// --tcp, plain TCP with the same frames. With --rdma, a peer's RdmaHello gets an RDMA READ window of a file
@@ -201,6 +224,46 @@ enum Command {
         #[command(subcommand)]
         action: PlanAction,
     },
+}
+
+#[derive(Subcommand)]
+enum TrustAction {
+    /// Print this node's identity (public key = Iroh endpoint id, and node_id).
+    Whoami {
+        #[arg(long, default_value = "local")]
+        node: String,
+        #[arg(long)]
+        key_file: Option<std::path::PathBuf>,
+    },
+    /// Print the trust provider and a summary of the registry.
+    Show,
+    /// List enrollments.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Record a decision about a server by its public key (64 hex chars).
+    Enroll {
+        pubkey: String,
+        #[arg(long, default_value = "")]
+        label: String,
+        /// A URL the server announced; repeat for several.
+        #[arg(long = "url")]
+        urls: Vec<String>,
+        #[arg(long, default_value = "home")]
+        zone: String,
+        /// Record as pending instead of accepted.
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Accept a known server (by node_id).
+    Accept { node_id: String },
+    /// Ignore a known server (by node_id).
+    Ignore { node_id: String },
+    /// Forget a server entirely.
+    Remove { node_id: String },
+    /// Set the trust provider stored in the registry: none, nexus or virtualizer.
+    SetProvider { provider: String },
 }
 
 #[derive(Subcommand)]
@@ -409,8 +472,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Demo => demo(),
         Command::Fleet { json, samples, paths, out } => fleet(json, samples, paths, out),
         Command::Plan { action } => plan_action(action),
-        Command::AgentServe { node } => agent_serve(&node),
-        Command::AgentConnect { addr } => agent_connect(&addr),
+        Command::AgentServe { node, trust, registry, key_file } => agent_serve(&node, trust, registry, key_file),
+        Command::Trust { registry, action } => trust_action(registry, action),
+        Command::AgentConnect { addr, key_file } => agent_connect(&addr, key_file),
         Command::DataServe { root, node, tcp, rdma } => data_serve(root, &node, tcp, rdma),
         Command::DataBench { path, file, addr, tcp, chunk, count, window_offset, window_len, cold, rdma, seed, rounds, json } => {
             data_bench(&path, &file, addr, tcp, &chunk, count, window_offset, window_len, cold, rdma, seed, rounds, json)
@@ -719,8 +783,96 @@ fn demo() -> Result<(), Box<dyn std::error::Error>> {
 /// demo exclusive GPU resource, then serves the RPC protocol over Iroh/QUIC
 /// until Ctrl-C. Prints the JSON-encoded `EndpointAddr` a controller process
 /// needs to connect (`nauti agent-connect <addr>`).
-fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn trust_action(
+    registry: Option<std::path::PathBuf>,
+    action: TrustAction,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use nauti_fabric::registry::{node_id_from_pubkey, Admission, Registry, TrustProvider};
+    let path = registry.unwrap_or_else(Registry::default_path);
+    match action {
+        TrustAction::Whoami { node, key_file } => {
+            let key = match key_file {
+                Some(p) => load_or_create_key_at(&p.to_string_lossy())?,
+                None => load_or_create_agent_key(&node)?,
+            };
+            let pubkey = key.public().to_string();
+            println!("pubkey (iroh endpoint id): {pubkey}");
+            println!("node_id: {}", node_id_from_pubkey(&pubkey)?);
+        }
+        TrustAction::Show => {
+            let reg = Registry::load(&path)?;
+            let count = |a: Admission| reg.entries.values().filter(|e| e.admission == a).count();
+            println!("registry: {}", path.display());
+            println!("trust_provider: {}", reg.trust_provider);
+            println!(
+                "entries: {} accepted, {} pending, {} ignored",
+                count(Admission::Accepted),
+                count(Admission::Pending),
+                count(Admission::Ignored)
+            );
+        }
+        TrustAction::List { json } => {
+            let reg = Registry::load(&path)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reg)?);
+            } else if reg.entries.is_empty() {
+                println!("(no enrollments in {})", path.display());
+            } else {
+                for e in reg.entries.values() {
+                    println!("{} {:?} {} zone={} urls={}", e.node_id, e.admission, e.label, e.zone, e.urls.join(","));
+                }
+            }
+        }
+        TrustAction::Enroll { pubkey, label, urls, zone, pending } => {
+            let mut reg = Registry::load(&path)?;
+            let admission = if pending { Admission::Pending } else { Admission::Accepted };
+            let id = reg.enroll(&pubkey, &label, &urls, &zone, admission)?;
+            reg.save(&path)?;
+            println!("{id} {admission:?}");
+        }
+        TrustAction::Accept { node_id } => {
+            let mut reg = Registry::load(&path)?;
+            reg.set_admission(&node_id, Admission::Accepted)?;
+            reg.save(&path)?;
+            println!("{node_id} Accepted");
+        }
+        TrustAction::Ignore { node_id } => {
+            let mut reg = Registry::load(&path)?;
+            reg.set_admission(&node_id, Admission::Ignored)?;
+            reg.save(&path)?;
+            println!("{node_id} Ignored");
+        }
+        TrustAction::Remove { node_id } => {
+            let mut reg = Registry::load(&path)?;
+            if !reg.remove(&node_id) {
+                return Err(format!("unknown node_id {node_id}").into());
+            }
+            reg.save(&path)?;
+            println!("{node_id} removed");
+        }
+        TrustAction::SetProvider { provider } => {
+            let mut reg = Registry::load(&path)?;
+            reg.trust_provider = provider.parse::<TrustProvider>()?;
+            reg.save(&path)?;
+            println!("trust_provider: {}", reg.trust_provider);
+        }
+    }
+    Ok(())
+}
+
+fn agent_serve(    node: &str,
+    trust: Option<String>,
+    registry: Option<std::path::PathBuf>,
+    key_file: Option<std::path::PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+    let registry_path = registry.unwrap_or_else(nauti_fabric::registry::Registry::default_path);
+    let trust_provider = match trust {
+        Some(t) => t.parse::<nauti_fabric::registry::TrustProvider>()?,
+        None => nauti_fabric::registry::Registry::load(&registry_path)?.trust_provider,
+    };
+    let auth = nauti_fabric::registry::build_provider(trust_provider, &registry_path)?;
+    println!("trust provider: {trust_provider} (auth layer: {}, registry: {})", auth.name(), registry_path.display());
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async move {
         let fabric = Arc::new(Fabric::default());
@@ -743,7 +895,10 @@ fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(all(feature = "vfio", feature = "cloud-hypervisor"))]
         fabric.register_adapter(Arc::new(nauti_fabric::vmm::VfioGpuAdapter::new()));
 
-        let secret_key = match load_or_create_agent_key(node) {
+        let secret_key = match match &key_file {
+            Some(path) => load_or_create_key_at(&path.to_string_lossy()),
+            None => load_or_create_agent_key(node),
+        } {
             Ok(key) => Some(key),
             Err(error) => {
                 println!("warning: agent identity not persisted ({error}); using an ephemeral key");
@@ -752,7 +907,7 @@ fn agent_serve(node: &str) -> Result<(), Box<dyn std::error::Error>> {
         };
         let (router, addr) = nauti_fabric::rpc::serve_with_identity(
             fabric,
-            Arc::new(nauti_fabric::rpc_auth::NoAuth),
+            auth,
             secret_key,
         )
         .await?;
@@ -928,12 +1083,16 @@ fn data_bench(
 
 /// Connects to a remote fabric agent and runs the two-process lease/attach/
 /// release proof against it end-to-end over authenticated Iroh/QUIC.
-fn agent_connect(addr_json: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn agent_connect(addr_json: &str, key_file: Option<std::path::PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
+    let identity = match key_file {
+        Some(p) => Some(load_or_create_key_at(&p.to_string_lossy())?),
+        None => None,
+    };
     let addr: iroh::EndpointAddr = serde_json::from_str(addr_json)?;
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async move {
-        let mut client = AgentClient::connect(addr).await.map_err(|error| error.to_string())?;
+        let mut client = AgentClient::connect_with_identity(addr, identity).await.map_err(|error| error.to_string())?;
 
         let pong = client.call(RpcRequest::Ping).await.map_err(|error| error.to_string())?;
         println!("ping -> {pong:?}");
