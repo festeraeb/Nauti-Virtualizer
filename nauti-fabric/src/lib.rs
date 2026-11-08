@@ -11,6 +11,7 @@ pub mod config;
 pub mod store;
 pub mod data;
 pub mod data_quic;
+pub mod route;
 #[cfg(feature = "rdma")]
 pub mod rdma;
 pub mod memory;

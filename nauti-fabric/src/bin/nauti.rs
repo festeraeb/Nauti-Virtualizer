@@ -39,6 +39,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Smart routing for bulk bytes: this node's capabilities, or the best path to another node.
+    Route {
+        #[command(subcommand)]
+        action: RouteAction,
+    },
     /// Discover resources available on this host.
     Inventory {
         /// Emit the resource model as JSON for a tool-calling model or automation.
@@ -401,11 +406,65 @@ enum VmAction {
     Reconcile,
 }
 
+#[derive(Subcommand)]
+enum RouteAction {
+    /// What this node can do for bulk transfers: links, speeds, RDMA ports and RoCE v2 GIDs, pinnable memory, NFS mounts.
+    Caps {
+        #[arg(long, default_value = "local")]
+        node: String,
+    },
+    /// Rank every path between a client and a server (capabilities JSON from `nauti route caps` on each).
+    Plan {
+        /// The server's capabilities JSON.
+        #[arg(long)]
+        server: std::path::PathBuf,
+        /// The client's capabilities JSON; this node when omitted.
+        #[arg(long)]
+        client: Option<std::path::PathBuf>,
+        /// GiB the server must pin for RDMA.
+        #[arg(long, default_value_t = 0)]
+        pin_gib: u64,
+        /// The file as this client sees it (an NFS path counts only if its mount holds the file).
+        #[arg(long)]
+        file: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn route_action(action: RouteAction) -> Result<(), Box<dyn std::error::Error>> {
+    use nauti_fabric::route::{select, Capabilities, Need};
+    match action {
+        RouteAction::Caps { node } => println!("{}", serde_json::to_string_pretty(&Capabilities::discover(&node))?),
+        RouteAction::Plan { server, client, pin_gib, file, json } => {
+            let server: Capabilities = serde_json::from_str(&std::fs::read_to_string(server)?)?;
+            let client: Capabilities = match client {
+                Some(p) => serde_json::from_str(&std::fs::read_to_string(p)?)?,
+                None => Capabilities::discover("local"),
+            };
+            let plan = select(&client, &server, &Need { pinned_bytes: pin_gib << 30, client_path: file });
+            if json {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            } else {
+                println!("{} -> {}: best {:?} at ~{} MB/s", plan.client, plan.server, plan.best().kind, plan.best().mb_per_s);
+                for (i, p) in plan.paths.iter().enumerate() {
+                    println!("  {}. {:?} ~{} MB/s{}: {}", i + 1, p.kind, p.mb_per_s, if p.measured { " (measured)" } else { "" }, p.reason);
+                }
+                for s in &plan.skipped {
+                    println!("  skipped: {s}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match Cli::parse().command {
         Command::Tools { json } => tools(json),
         Command::Adapters { json } => adapters(json),
         Command::Inventory { json, node, refresh } => inventory(&node, json, refresh),
+        Command::Route { action } => route_action(action),
         Command::Demo => demo(),
         Command::Fleet { json, samples, paths, out } => fleet(json, samples, paths, out),
         Command::Plan { action } => plan_action(action),
