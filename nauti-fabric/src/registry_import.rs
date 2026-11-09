@@ -38,9 +38,7 @@ pub fn pubkey_hex_from_lemond(key: &str) -> Result<String, RegistryError> {
     }
     
     // Strip optional "ed25519:" prefix
-    let rest = s.strip_prefix("ed25519:").ok_or_else(|| {
-        RegistryError::Invalid("invalid key".into())
-    })?;
+    let rest = s.strip_prefix("ed25519:").unwrap_or(s);
     
     // Strip trailing '=' padding
     let rest = rest.trim_end_matches('=');
