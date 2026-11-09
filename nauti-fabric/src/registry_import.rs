@@ -39,7 +39,7 @@ pub fn pubkey_hex_from_lemond(key: &str) -> Result<String, RegistryError> {
     
     // Strip optional "ed25519:" prefix
     let rest = s.strip_prefix("ed25519:").ok_or_else(|| {
-        RegistryError::Invalid("missing ed25519: prefix".into())
+        RegistryError::Invalid("invalid key".into())
     })?;
     
     // Strip trailing '=' padding
@@ -50,11 +50,11 @@ pub fn pubkey_hex_from_lemond(key: &str) -> Result<String, RegistryError> {
     
     // Verify exactly 32 bytes
     if decoded.len() != 32 {
-        return Err(RegistryError::Invalid(format!("decoded key is {} bytes, expected 32", decoded.len())));
+        return Err(RegistryError::Invalid("invalid key".into()));
     }
     
     // Convert to 64 lowercase hex
-    Ok(decoded.iter().map(|b| format!("{:02x}", b)).collect())
+    Ok(decoded.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 fn decode_base64_manual(input: &str) -> Result<Vec<u8>, RegistryError> {
@@ -69,7 +69,7 @@ fn decode_base64_manual(input: &str) -> Result<Vec<u8>, RegistryError> {
             '0'..='9' => ch as u32 - '0' as u32 + 52,
             '+' | '-' => 62,
             '/' | '_' => 63,
-            _ => return Err(RegistryError::Invalid(format!("invalid base64 character: {}", ch))),
+            _ => return Err(RegistryError::Invalid("invalid key".into())),
         };
         
         bits = (bits << 6) | val;
@@ -84,7 +84,7 @@ fn decode_base64_manual(input: &str) -> Result<Vec<u8>, RegistryError> {
     // If there are remaining bits, they should be zero (padding)
     if bit_count > 0 {
         if (bits & ((1 << bit_count) - 1)) != 0 {
-            return Err(RegistryError::Invalid("invalid base64 padding bits".into()));
+            return Err(RegistryError::Invalid("invalid key".into()));
         }
     }
     
@@ -102,11 +102,11 @@ fn decode_base64_manual(input: &str) -> Result<Vec<u8>, RegistryError> {
 /// An empty `servers` object is fine (all counts 0).
 pub fn import_lemonade_choices(reg: &mut Registry, choices_json: &str) -> Result<ImportSummary, RegistryError> {
     let v: serde_json::Value = serde_json::from_str(choices_json)
-        .map_err(|e| RegistryError::Invalid(format!("invalid JSON: {}", e)))?;
+        .map_err(|_| RegistryError::Invalid("invalid JSON".into()))?;
     
     let servers = v.get("servers")
         .and_then(|x| x.as_object())
-        .ok_or_else(|| RegistryError::Invalid("missing or non-object servers".into()))?;
+        .ok_or_else(|| RegistryError::Invalid("invalid JSON".into()))?;
     
     let mut summary = ImportSummary::default();
     
@@ -128,7 +128,7 @@ pub fn import_lemonade_choices(reg: &mut Registry, choices_json: &str) -> Result
             "accepted" => Admission::Accepted,
             "ignored" => Admission::Ignored,
             other => {
-                summary.errors.push(format!("unknown choice {} for {}: {}", other, id, key));
+                summary.errors.push(format!("{}: invalid choice", id));
                 continue;
             }
         };
@@ -137,7 +137,7 @@ pub fn import_lemonade_choices(reg: &mut Registry, choices_json: &str) -> Result
         let hex = match pubkey_hex_from_lemond(key) {
             Ok(h) => h,
             Err(e) => {
-                summary.errors.push(format!("bad key for {}: {}: {}", id, key, e));
+                summary.errors.push(format!("{}: {}", id, e));
                 continue;
             }
         };
@@ -146,7 +146,7 @@ pub fn import_lemonade_choices(reg: &mut Registry, choices_json: &str) -> Result
         let urls = if url.is_empty() { Vec::new() } else { vec![url.to_string()] };
         match reg.enroll(&hex, hostname, &urls, "", admission) {
             Ok(_) => summary.imported += 1,
-            Err(e) => summary.errors.push(format!("enroll error for {}: {}", id, e)),
+            Err(e) => summary.errors.push(format!("{}: {}", id, e)),
         }
     }
     
