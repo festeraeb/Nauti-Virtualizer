@@ -8,6 +8,7 @@ pub mod plan;
 pub mod rpc;
 pub mod rpc_auth;
 pub mod registry;
+pub mod registry_import;
 pub mod config;
 pub mod store;
 pub mod data;
