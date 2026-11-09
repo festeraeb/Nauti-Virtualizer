@@ -340,6 +340,42 @@ impl Registry {
     }
 }
 
+/// Check an enrollment's sponsor signature against the sponsor's public key.
+///
+/// `sponsor_pubkey_hex` is 64 hex characters. Fails if the enrollment has no
+/// sponsor, if the key does not derive the recorded `sponsor_node_id`, if the
+/// signature is not 128 hex characters, or if it does not verify over
+/// [`Enrollment::canonical_bytes`].
+pub fn verify_sponsor(enrollment: &Enrollment, sponsor_pubkey_hex: &str) -> Result<(), RegistryError> {
+    let _ = (enrollment, sponsor_pubkey_hex);
+    todo!("implement verify_sponsor")
+}
+
+/// What [`Registry::merge`] did.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MergeReport {
+    pub added_pending: usize,
+    pub updated: usize,
+    pub conflicts: Vec<String>,
+}
+
+impl Registry {
+    /// Merge records reported by another node (a branch head's view).
+    ///
+    /// A node unknown here is added as `Pending`, whatever the other side
+    /// decided: trust is never inherited. A known node keeps its local
+    /// admission, label, zone and decision time; its URLs become the sorted,
+    /// de-duplicated union of both sides, and it takes the other side's
+    /// sponsor only if it has none (counted in `updated` when anything
+    /// changed). A record whose `pubkey` does not derive its `node_id`, or
+    /// that disagrees with the local `pubkey`, changes nothing and its
+    /// `node_id` is listed in `conflicts`.
+    pub fn merge(&mut self, other: &Registry) -> MergeReport {
+        let _ = other;
+        todo!("implement Registry::merge")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AuthProvider
 // ---------------------------------------------------------------------------
