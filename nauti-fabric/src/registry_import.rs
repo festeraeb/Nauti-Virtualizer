@@ -1,12 +1,9 @@
 //! Import the Lemonade app's saved server choices (#1221 "found on this network") into the trust registry.
 //!
 //! The app keeps the user's Use / Ignore choices in `lan_servers.json` (under the OS config dir,
-//! `lemonade/lan_servers.json`):
-//!
-//! ```json
-//! {"servers": {"desk:13305": {"choice": "accepted", "hostname": "desk", "url": "http://192.168.4.10:13305",
-//!                             "updated": 1794200000, "public_key": "ed25519:f6Y3aCO2va1Ht3WvqmkTo6J_VBcAoWrV5nEM8SOJ4vY"}}}
-//! ```
+//! `lemonade/lan_servers.json`): an object `servers` mapping a choice id (e.g. "desk:13305") to
+//! {"choice": "accepted" or "ignored", "hostname": "desk", "url": "http://192.168.4.10:13305", "updated": 1794200000,
+//! "public_key": "ed25519:f6Y3aCO2va1Ht3WvqmkTo6J_VBcAoWrV5nEM8SOJ4vY"}.
 //!
 //! `public_key` is the server's lemond device key, as its `/api/v1/nexus/status` reports it, saved when the user
 //! made the choice. Choices saved before the app recorded keys have none and cannot be enrolled (the registry is keyed
