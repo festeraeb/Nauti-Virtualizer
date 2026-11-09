@@ -125,7 +125,7 @@ pub fn import_lemonade_choices(reg: &mut Registry, choices_json: &str) -> Result
         let admission = match choice_str {
             "accepted" => Admission::Accepted,
             "ignored" => Admission::Ignored,
-            other => {
+            _other => {
                 summary.errors.push(format!("{}: invalid choice", id));
                 continue;
             }
