@@ -317,15 +317,42 @@ pub async fn serve_with_identity(
     Ok((router, addr))
 }
 
-/// LAN addresses (10/8, 192.168/16) are direct; carrier NAT 100.64/10 is not,
-/// so the node's relay is kept.
+/// Direct: LAN (10/8, 192.168/16), public IPv4, and global IPv6.
+/// Not direct: carrier NAT 100.64/10, 172.16/12 (docker bridges), loopback,
+/// link-local, multicast, unspecified, broadcast, documentation, and IPv6
+/// unique-local (fc00::/7) — for those the node's relay is kept.
 fn is_direct_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
-            o[0] == 10 || (o[0] == 192 && o[1] == 168)
+            // LAN ranges come first: is_private() also covers them.
+            if o[0] == 10 || (o[0] == 192 && o[1] == 168) {
+                return true;
+            }
+            if v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || (o[0] == 100 && (64..128).contains(&o[1]))
+            {
+                return false;
+            }
+            true
         }
-        std::net::IpAddr::V6(_) => false,
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || v6.is_unique_local()
+                || v6.is_unicast_link_local()
+            {
+                return false;
+            }
+            true
+        }
     }
 }
 
@@ -438,5 +465,33 @@ mod tests {
             p.addrs.iter().next().unwrap(),
             &TransportAddr::Ip("10.0.0.1:4433".parse().unwrap())
         );
+    }
+
+    #[test]
+    fn public_ip_is_direct() {
+        // Direct: public IPv4, global IPv6, LAN.
+        assert!(is_direct_ip("8.8.8.8".parse::<std::net::IpAddr>().unwrap()));
+        assert!(is_direct_ip("1.1.1.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(is_direct_ip("2001:4860:4860::8888".parse::<std::net::IpAddr>().unwrap()));
+        assert!(is_direct_ip("10.0.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(is_direct_ip("192.168.4.10".parse::<std::net::IpAddr>().unwrap()));
+
+        // Not direct: carrier NAT, loopback, link-local, private, unspecified,
+        // multicast, IPv6 loopback/link-local/ULA/multicast.
+        assert!(!is_direct_ip("100.64.0.5".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("127.0.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("169.254.1.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("172.17.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("0.0.0.0".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("224.0.0.1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("::1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("fe80::1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("fd00::1".parse::<std::net::IpAddr>().unwrap()));
+        assert!(!is_direct_ip("ff02::1".parse::<std::net::IpAddr>().unwrap()));
+
+        // A public IP is direct now, so the relay is dropped.
+        let a = addr_with_relay(&["8.8.8.8:4433"]);
+        let p = prefer_direct(a);
+        assert_eq!(p.addrs.len(), 1);
     }
 }
