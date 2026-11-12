@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex};
 /// ALPN of the data protocol.
 pub const DATA_ALPN: &[u8] = b"nauti-fabric/data/1";
 
+/// How long a direct (non-relay) data connect may take before it is given up.
+pub const DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A queue pair's numbers, as the control link carries them (gid as 32 hex digits).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QpInfo {
