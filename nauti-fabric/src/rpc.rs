@@ -27,11 +27,12 @@ use std::time::Duration;
 
 use iroh::endpoint::{Connection, ConnectionError};
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr, endpoint::presets};
+use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
+use crate::fabric_relay::fabric_endpoint;
 use crate::rpc_auth::{AuthProvider, NoAuth, RequestContext};
 use crate::{Attachment, Fabric, FabricError, Lease, Resource, ResourceRequest};
 
@@ -301,11 +302,7 @@ pub async fn serve_with_identity(
     auth: Arc<dyn AuthProvider>,
     secret_key: Option<SecretKey>,
 ) -> Result<(Router, EndpointAddr), RpcTransportError> {
-    let mut builder = Endpoint::builder(presets::N0);
-    if let Some(key) = secret_key {
-        builder = builder.secret_key(key);
-    }
-    let endpoint = builder
+    let endpoint = fabric_endpoint(secret_key)?
         .bind()
         .await
         .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
@@ -398,11 +395,7 @@ impl AgentClient {
         addr: EndpointAddr,
         secret_key: Option<SecretKey>,
     ) -> Result<Self, RpcTransportError> {
-        let mut builder = Endpoint::builder(presets::N0);
-        if let Some(key) = secret_key {
-            builder = builder.secret_key(key);
-        }
-        let endpoint = builder
+        let endpoint = fabric_endpoint(secret_key)?
             .bind()
             .await
             .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;

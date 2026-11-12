@@ -9,9 +9,10 @@
 //!
 //! Framing is `rpc`'s: a u32 little-endian length and JSON; a Bytes response is followed by its raw payload.
 use crate::data::{ChunkSource, MappedFile};
+use crate::fabric_relay::fabric_endpoint;
 use crate::rpc::{RpcTransportError, prefer_direct, read_frame, write_frame};
 
-use iroh::endpoint::{Connection, presets};
+use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
@@ -210,11 +211,7 @@ pub async fn serve_quic(
     server: Arc<DataServer>,
     secret_key: Option<SecretKey>,
 ) -> Result<(Router, EndpointAddr), RpcTransportError> {
-    let mut builder = Endpoint::builder(presets::N0);
-    if let Some(key) = secret_key {
-        builder = builder.secret_key(key);
-    }
-    let endpoint = builder.bind().await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+    let endpoint = fabric_endpoint(secret_key)?.bind().await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
     endpoint.online().await;
     let addr = endpoint.addr();
     let router = Router::builder(endpoint).accept(DATA_ALPN, DataService(server)).spawn();
@@ -321,7 +318,7 @@ impl QuicDataClient {
         } else {
             prefer_direct(addr)
         };
-        let endpoint = Endpoint::bind(presets::N0).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+        let endpoint = fabric_endpoint(None)?.bind().await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
         if relay {
             endpoint.online().await;
         }

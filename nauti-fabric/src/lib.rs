@@ -6,6 +6,7 @@ pub mod hwinfo;
 pub mod peer;
 pub mod plan;
 pub mod rpc;
+pub mod fabric_relay;
 pub mod rpc_auth;
 pub mod registry;
 pub mod registry_import;
