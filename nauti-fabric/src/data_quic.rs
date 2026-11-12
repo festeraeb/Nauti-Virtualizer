@@ -9,7 +9,7 @@
 //!
 //! Framing is `rpc`'s: a u32 little-endian length and JSON; a Bytes response is followed by its raw payload.
 use crate::data::{ChunkSource, MappedFile};
-use crate::fabric_relay::fabric_endpoint;
+use crate::fabric_relay::{direct_endpoint, fabric_endpoint};
 use crate::rpc::{RpcTransportError, prefer_direct, read_frame, write_frame};
 
 use iroh::endpoint::Connection;
@@ -318,17 +318,27 @@ impl QuicDataClient {
         } else {
             prefer_direct(addr)
         };
-        let endpoint = fabric_endpoint(None)?.bind().await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+        // A direct attempt binds an endpoint without relay and lookup, so it
+        // fails when no direct path works instead of ending on a relay.
+        let builder = if relay { fabric_endpoint(None)? } else { direct_endpoint(None)? };
+        let endpoint = builder.bind().await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
         if relay {
             endpoint.online().await;
         }
-        let connection = if relay {
-            endpoint.connect(addr, DATA_ALPN).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?
+        let attempt = if relay {
+            endpoint.connect(addr, DATA_ALPN).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))
         } else {
-            tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, endpoint.connect(addr, DATA_ALPN))
-                .await
-                .map_err(|_| RpcTransportError::Timeout(DIRECT_CONNECT_TIMEOUT))?
-                .map_err(|e| RpcTransportError::Iroh(e.to_string()))?
+            match tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, endpoint.connect(addr, DATA_ALPN)).await {
+                Err(_) => Err(RpcTransportError::Timeout(DIRECT_CONNECT_TIMEOUT)),
+                Ok(result) => result.map_err(|e| RpcTransportError::Iroh(e.to_string())),
+            }
+        };
+        let connection = match attempt {
+            Ok(connection) => connection,
+            Err(error) => {
+                endpoint.close().await;
+                return Err(error);
+            }
         };
         let (send, recv) = connection.open_bi().await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
         Ok(Self { _endpoint: endpoint, connection, stream: DataStream::new(recv, send) })
@@ -463,6 +473,20 @@ impl QuicChunkSource {
     pub fn connect_auto(addr: EndpointAddr, file: &str) -> io::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let mut client = rt.block_on(connect_direct_then_relay(addr)).map_err(io::Error::other)?;
+        let bytes = rt.block_on(client.stream.stat(file)).map_err(io::Error::other)?;
+        tracing::info!("{}", bulk_path_line(file, bytes, client.is_relayed(), &client.path()));
+        let relay = client.is_relayed();
+        Ok(Self { rt, client, file: file.into(), relay })
+    }
+
+    /// The bulk path with the path choice `preference` names (Auto is
+    /// [`Self::connect_auto`]). Logs the same one line after the connect.
+    pub fn connect_with(addr: EndpointAddr, preference: TransportPreference, file: &str) -> io::Result<Self> {
+        if preference == TransportPreference::Auto {
+            return Self::connect_auto(addr, file);
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let mut client = rt.block_on(QuicDataClient::connect_with(addr, preference)).map_err(io::Error::other)?;
         let bytes = rt.block_on(client.stream.stat(file)).map_err(io::Error::other)?;
         tracing::info!("{}", bulk_path_line(file, bytes, client.is_relayed(), &client.path()));
         let relay = client.is_relayed();

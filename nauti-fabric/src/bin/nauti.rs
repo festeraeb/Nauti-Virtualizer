@@ -143,6 +143,10 @@ enum Command {
         rounds: usize,
         #[arg(long)]
         json: bool,
+        /// quic-auto: how the connection chooses between the direct path and
+        /// the relay: auto | completion-first | direct-only.
+        #[arg(long, default_value = "auto")]
+        transport: String,
     },
     /// Drive a remote fabric agent over the RPC contract — the verbs an
     /// LLM-facing tool layer (MCP) calls. `addr` is the JSON-encoded
@@ -476,8 +480,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Trust { registry, action } => trust_action(registry, action),
         Command::AgentConnect { addr, key_file } => agent_connect(&addr, key_file),
         Command::DataServe { root, node, tcp, rdma } => data_serve(root, &node, tcp, rdma),
-        Command::DataBench { path, file, addr, tcp, chunk, count, window_offset, window_len, cold, rdma, seed, rounds, json } => {
-            data_bench(&path, &file, addr, tcp, &chunk, count, window_offset, window_len, cold, rdma, seed, rounds, json)
+        Command::DataBench { path, file, addr, tcp, chunk, count, window_offset, window_len, cold, rdma, seed, rounds, json, transport } => {
+            data_bench(&path, &file, addr, tcp, &chunk, count, window_offset, window_len, cold, rdma, seed, rounds, json, &transport)
         }
         Command::Fabric { action } => fabric_action(action),
         #[cfg(feature = "numa")]
@@ -865,7 +869,7 @@ fn agent_serve(    node: &str,
     registry: Option<std::path::PathBuf>,
     key_file: Option<std::path::PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    init_logging();
     let registry_path = registry.unwrap_or_else(nauti_fabric::registry::Registry::default_path);
     let trust_provider = match trust {
         Some(t) => t.parse::<nauti_fabric::registry::TrustProvider>()?,
@@ -932,7 +936,7 @@ fn data_serve(
     tcp: Option<std::net::SocketAddr>,
     rdma: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    init_logging();
     let rdma = match rdma {
         Some(spec) => {
             #[cfg(feature = "rdma")]
@@ -998,8 +1002,11 @@ fn data_bench(
     seed: u64,
     rounds: usize,
     json: bool,
+    transport: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    init_logging();
+    let transport: nauti_fabric::data_quic::TransportPreference =
+        transport.parse().map_err(|e: String| format!("--transport: {e}"))?;
     use nauti_fabric::data::{ChunkSource, MappedFile, bench, parse_size, scattered_offsets};
     use nauti_fabric::data_quic::{QuicChunkSource, TcpChunkSource};
     let chunk = parse_size(chunk).ok_or_else(|| format!("--chunk {chunk}: a size like 24K or 23M"))?;
@@ -1019,7 +1026,7 @@ fn data_bench(
             (Box::new(c), size)
         }
         "quic-auto" => {
-            let mut c = QuicChunkSource::connect_auto(addr_of(path)?, file)?;
+            let mut c = QuicChunkSource::connect_with(addr_of(path)?, transport, file)?;
             let size = c.stat()?;
             (Box::new(c), size)
         }
@@ -1090,7 +1097,7 @@ fn data_bench(
 /// Connects to a remote fabric agent and runs the two-process lease/attach/
 /// release proof against it end-to-end over authenticated Iroh/QUIC.
 fn agent_connect(addr_json: &str, key_file: Option<std::path::PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    init_logging();
     let identity = match key_file {
         Some(p) => Some(load_or_create_key_at(&p.to_string_lossy())?),
         None => None,
@@ -1372,7 +1379,7 @@ enum FabricAction {
 /// Every failure path returns a typed, printable error — the tool layer
 /// surfaces these verbatim, so unreachable agents degrade instead of panicking.
 fn fabric_action(action: FabricAction) -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    init_logging();
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     runtime.block_on(async {
         let addr: String = match &action {
@@ -2060,4 +2067,12 @@ mod tests {
             assert_eq!(addr_file_path("cesarops2"), "/var/lib/nauti/cesarops2-addr.json");
         }
     }
+}
+
+/// Log to the terminal at INFO and above. Explicit, because
+/// `tracing_subscriber::fmt::init()` changes its default to ERROR when a
+/// dependency turns on the `env-filter` feature (iroh-relay's server does in
+/// test builds), and the bulk path's warn and info lines then vanish.
+fn init_logging() {
+    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 }

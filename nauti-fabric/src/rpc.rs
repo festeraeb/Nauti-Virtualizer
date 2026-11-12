@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 
-use crate::fabric_relay::fabric_endpoint;
+use crate::fabric_relay::{direct_endpoint, fabric_endpoint};
 use crate::rpc_auth::{AuthProvider, NoAuth, RequestContext};
 use crate::{Attachment, Fabric, FabricError, Lease, Resource, ResourceRequest};
 
@@ -395,28 +395,26 @@ impl AgentClient {
         addr: EndpointAddr,
         secret_key: Option<SecretKey>,
     ) -> Result<Self, RpcTransportError> {
-        let endpoint = fabric_endpoint(secret_key)?
+        // The direct attempt: an endpoint without relay and lookup, so it
+        // fails when no direct path works instead of ending on a relay.
+        let direct = direct_endpoint(secret_key.clone())?
             .bind()
             .await
             .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
-
-        // Try direct connect with timeout, then fall back to relay
-        let connection = match tokio::time::timeout(
-            CONTROL_DIRECT_TIMEOUT,
-            endpoint.connect(prefer_direct(addr.clone()), ALPN),
-        )
-        .await
-        {
-            Ok(Ok(conn)) => conn,
+        let attempt = tokio::time::timeout(CONTROL_DIRECT_TIMEOUT, direct.connect(prefer_direct(addr.clone()), ALPN)).await;
+        let (endpoint, connection) = match attempt {
+            Ok(Ok(conn)) => (direct, conn),
             Ok(Err(e)) => {
                 let why = e.to_string();
                 warn!(error = %why, "agent rpc: direct connect failed; trying the relay");
-                Self::connect_via_relay(&endpoint, addr, why).await?
+                direct.close().await;
+                Self::connect_via_relay(secret_key, addr, why).await?
             }
             Err(_elapsed) => {
                 let why = format!("timed out after {CONTROL_DIRECT_TIMEOUT:?}");
                 warn!(error = %why, "agent rpc: direct connect failed; trying the relay");
-                Self::connect_via_relay(&endpoint, addr, why).await?
+                direct.close().await;
+                Self::connect_via_relay(secret_key, addr, why).await?
             }
         };
 
@@ -427,12 +425,13 @@ impl AgentClient {
         Ok(Self { endpoint, connection, send, recv })
     }
 
-    /// Connect via relay addresses from the given EndpointAddr.
+    /// Connect via the relay addresses of `addr`, on an endpoint with the
+    /// fabric relay.
     async fn connect_via_relay(
-        endpoint: &Endpoint,
+        secret_key: Option<SecretKey>,
         addr: EndpointAddr,
         why: String,
-    ) -> Result<Connection, RpcTransportError> {
+    ) -> Result<(Endpoint, Connection), RpcTransportError> {
         let relays: std::collections::BTreeSet<TransportAddr> = addr
             .addrs
             .iter()
@@ -444,12 +443,17 @@ impl AgentClient {
                 "direct connect failed ({why}) and the agent advertises no relay"
             )));
         }
+        let endpoint = fabric_endpoint(secret_key)?
+            .bind()
+            .await
+            .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
         endpoint.online().await;
         let relay_addr = EndpointAddr { id: addr.id, addrs: relays };
-        endpoint
+        let connection = endpoint
             .connect(relay_addr, ALPN)
             .await
-            .map_err(|error| RpcTransportError::Iroh(error.to_string()))
+            .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
+        Ok((endpoint, connection))
     }
 
     /// Sends a request and awaits its response on the shared bidi stream.
