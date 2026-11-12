@@ -105,15 +105,15 @@ enum Command {
         rdma: Option<String>,
     },
     /// Measure one data path on scattered chunks of a file, the same chunks for every path: nfs-mmap (a local
-    /// path, through this host's NFS mount), quic, quic-relay, tcp, roce. Prints a table row, or JSON.
+    /// path, through this host's NFS mount), quic, quic-relay, quic-auto, tcp, roce. Prints a table row, or JSON.
     DataBench {
-        /// nfs-mmap | quic | quic-relay | tcp | roce
+        /// nfs-mmap | quic | quic-relay | quic-auto | tcp | roce
         #[arg(long)]
         path: String,
         /// For nfs-mmap: the file's local path. Otherwise: its name under the server's root.
         #[arg(long)]
         file: String,
-        /// The server's EndpointAddr JSON, or @path of its address file (quic, quic-relay, roce).
+        /// The server's EndpointAddr JSON, or @path of its address file (quic, quic-relay, quic-auto, roce).
         #[arg(long)]
         addr: Option<String>,
         /// The server's TCP address (tcp).
@@ -1017,6 +1017,11 @@ fn data_bench(
             let size = c.stat()?;
             (Box::new(c), size)
         }
+        "quic-auto" => {
+            let mut c = QuicChunkSource::connect_auto(addr_of(path)?, file)?;
+            let size = c.stat()?;
+            (Box::new(c), size)
+        }
         "tcp" => {
             let mut c = TcpChunkSource::connect(tcp.ok_or("--path tcp needs --tcp HOST:PORT")?, file)?;
             let size = c.stat()?;
@@ -1039,7 +1044,7 @@ fn data_bench(
                 return Err("--path roce: this nauti was built without the rdma feature".into());
             }
         }
-        other => return Err(format!("--path {other}: nfs-mmap, quic, quic-relay, tcp or roce").into()),
+        other => return Err(format!("--path {other}: nfs-mmap, quic, quic-relay, quic-auto, tcp or roce").into()),
     };
     if window_offset >= size {
         return Err(format!("--window-offset {window_offset} is past the file ({size} bytes)").into());

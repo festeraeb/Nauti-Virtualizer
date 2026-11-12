@@ -380,6 +380,14 @@ impl QuicChunkSource {
         Ok(Self { rt, client, file: file.into(), relay })
     }
 
+    /// The bulk path: the direct path first, the relay when that fails ([`connect_direct_then_relay`]).
+    pub fn connect_auto(addr: EndpointAddr, file: &str) -> io::Result<Self> {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let client = rt.block_on(connect_direct_then_relay(addr)).map_err(io::Error::other)?;
+        let relay = client.is_relayed();
+        Ok(Self { rt, client, file: file.into(), relay })
+    }
+
     pub fn stat(&mut self) -> io::Result<u64> {
         self.rt.block_on(self.client.stream.stat(&self.file)).map_err(io::Error::other)
     }
