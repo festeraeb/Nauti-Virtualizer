@@ -403,3 +403,30 @@ impl AgentClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An address with the given socket addresses plus one relay.
+    fn addr_with_relay(ips: &[&str]) -> EndpointAddr {
+        let id = SecretKey::from_bytes(&[7u8; 32]).public();
+        let mut addrs: std::collections::BTreeSet<TransportAddr> = ips
+            .iter()
+            .map(|ip| TransportAddr::Ip(ip.parse::<std::net::SocketAddr>().unwrap()))
+            .collect();
+        addrs.insert(TransportAddr::Relay("https://relay.example.org./".parse().unwrap()));
+        EndpointAddr { id, addrs }
+    }
+
+    #[test]
+    fn prefer_direct_strips_relay_when_cgnat_present() {
+        let a = addr_with_relay(&["100.64.0.5:4433"]);
+        let id = a.id;
+        let p = prefer_direct(a);
+        assert_eq!(p.addrs.len(), 1);
+        assert!(p.addrs.contains(&TransportAddr::Ip("100.64.0.5:4433".parse().unwrap())));
+        assert!(!p.addrs.iter().any(|t| matches!(t, TransportAddr::Relay(_))));
+        assert_eq!(p.id, id);
+    }
+}
