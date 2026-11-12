@@ -317,14 +317,13 @@ pub async fn serve_with_identity(
     Ok((router, addr))
 }
 
-/// Private / CGNAT (Tailscale) address: reachable without the relay.
+/// LAN addresses (10/8, 192.168/16) are direct; carrier NAT 100.64/10 is not,
+/// so the node's relay is kept.
 fn is_direct_ip(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
-            o[0] == 10
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 100 && (64..128).contains(&o[1]))
+            o[0] == 10 || (o[0] == 192 && o[1] == 168)
         }
         std::net::IpAddr::V6(_) => false,
     }
@@ -422,13 +421,22 @@ mod tests {
     }
 
     #[test]
-    fn prefer_direct_strips_relay_when_cgnat_present() {
+    fn cgnat_keeps_relay() {
+        // CGNAT address: nothing is direct, so the full address (Ip + Relay) comes back
         let a = addr_with_relay(&["100.64.0.5:4433"]);
-        let id = a.id;
-        let p = prefer_direct(a);
-        assert_eq!(p.addrs.len(), 1);
+        let p = prefer_direct(a.clone());
+        assert_eq!(p, a);
+        assert_eq!(p.addrs.len(), 2);
         assert!(p.addrs.contains(&TransportAddr::Ip("100.64.0.5:4433".parse().unwrap())));
-        assert!(!p.addrs.iter().any(|t| matches!(t, TransportAddr::Relay(_))));
-        assert_eq!(p.id, id);
+        assert!(p.addrs.iter().any(|t| matches!(t, TransportAddr::Relay(_))));
+
+        // LAN address: relay is stripped, only the direct Ip remains
+        let lan = addr_with_relay(&["10.0.0.1:4433"]);
+        let p = prefer_direct(lan);
+        assert_eq!(p.addrs.len(), 1);
+        assert_eq!(
+            p.addrs.iter().next().unwrap(),
+            &TransportAddr::Ip("10.0.0.1:4433".parse().unwrap())
+        );
     }
 }
