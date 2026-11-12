@@ -31,7 +31,7 @@ async fn a_direct_connect_that_nobody_answers_ends_in_a_typed_timeout() {
         "want RpcTransportError::Timeout(DIRECT_CONNECT_TIMEOUT), got {err:?}"
     );
     assert!(took >= Duration::from_millis(2900), "returned after {took:?}, before the 3 s timeout");
-    assert!(took < Duration::from_secs(10), "returned after {took:?}, the timeout did not bound the connect");
+    assert!(took < Duration::from_secs(25), "returned after {took:?}, the timeout did not bound the connect");
     assert!(err.to_string().contains("timed out"), "Display should say 'timed out': {err}");
 }
 

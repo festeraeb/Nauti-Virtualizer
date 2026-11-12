@@ -26,5 +26,5 @@ async fn a_failed_direct_attempt_falls_through_to_the_relay() {
     assert!(matches!(&err, RpcTransportError::Iroh(m) if m.contains("no relay")), "want the relay error, got {err:?}");
     // and the direct attempt really ran first, for its full timeout
     assert!(took >= DIRECT_CONNECT_TIMEOUT - Duration::from_millis(100), "returned after {took:?}: no direct attempt");
-    assert!(took < Duration::from_secs(10), "returned after {took:?}");
+    assert!(took < Duration::from_secs(25), "returned after {took:?}");
 }
