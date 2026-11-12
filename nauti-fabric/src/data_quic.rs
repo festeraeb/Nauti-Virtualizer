@@ -354,6 +354,17 @@ impl QuicDataClient {
     }
 }
 
+/// The bulk path's connect: the direct path first, and when that fails (timeout or error), the relay.
+pub async fn connect_direct_then_relay(addr: EndpointAddr) -> Result<QuicDataClient, RpcTransportError> {
+    match QuicDataClient::connect(addr.clone(), false).await {
+        Ok(client) => Ok(client),
+        Err(e) => {
+            tracing::warn!(error = %e, "data quic: direct connect failed; trying the relay");
+            QuicDataClient::connect(addr, true).await
+        }
+    }
+}
+
 /// One file over QUIC, as a [`ChunkSource`] for the bench (a runtime of its own drives the async client).
 pub struct QuicChunkSource {
     rt: tokio::runtime::Runtime,
