@@ -310,17 +310,21 @@ pub struct QuicDataClient {
 impl QuicDataClient {
     /// Connects over the server's direct addresses, or, with `relay`, over its relay alone.
     pub async fn connect(addr: EndpointAddr, relay: bool) -> Result<Self, RpcTransportError> {
-        let endpoint = Endpoint::bind(presets::N0).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+        // The no-relay refusal needs no endpoint: check before binding (bind
+        // can block on relay DNS), so relay=true never makes a direct attempt.
         let addr = if relay {
             let a = relay_only(addr);
             if a.addrs.is_empty() {
                 return Err(RpcTransportError::Iroh("the server advertises no relay".into()));
             }
-            endpoint.online().await;
             a
         } else {
             prefer_direct(addr)
         };
+        let endpoint = Endpoint::bind(presets::N0).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+        if relay {
+            endpoint.online().await;
+        }
         let connection = if relay {
             endpoint.connect(addr, DATA_ALPN).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?
         } else {
