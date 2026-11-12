@@ -367,6 +367,83 @@ pub async fn connect_direct_then_relay(addr: EndpointAddr) -> Result<QuicDataCli
     }
 }
 
+/// How a data connection chooses between the direct path and the relay.
+///
+/// A transport capability only: it names no job or priority. A caller with
+/// its own policy (for example a runner that maps a job's priority) picks
+/// the variant. The tokens (`auto`, `completion-first`, `direct-only`) are
+/// the command-line and config form.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransportPreference {
+    /// Direct first (bounded by [`DIRECT_CONNECT_TIMEOUT`]), then the relay:
+    /// [`connect_direct_then_relay`].
+    #[default]
+    Auto,
+    /// The relay as soon as the direct path is not immediate
+    /// ([`COMPLETION_FIRST_DIRECT_BUDGET`]): finishing matters more than
+    /// the faster path.
+    CompletionFirst,
+    /// Never the relay: fail when no direct path connects.
+    DirectOnly,
+}
+
+/// How long [`TransportPreference::CompletionFirst`] gives the direct path
+/// before it goes to the relay.
+pub const COMPLETION_FIRST_DIRECT_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+impl TransportPreference {
+    pub const fn token(self) -> &'static str {
+        match self {
+            TransportPreference::Auto => "auto",
+            TransportPreference::CompletionFirst => "completion-first",
+            TransportPreference::DirectOnly => "direct-only",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportPreference {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.token())
+    }
+}
+
+impl std::str::FromStr for TransportPreference {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(TransportPreference::Auto),
+            "completion-first" => Ok(TransportPreference::CompletionFirst),
+            "direct-only" => Ok(TransportPreference::DirectOnly),
+            other => Err(format!("unknown transport preference {other:?} (auto | completion-first | direct-only)")),
+        }
+    }
+}
+
+impl QuicDataClient {
+    /// Connects with the path choice `preference` names.
+    pub async fn connect_with(addr: EndpointAddr, preference: TransportPreference) -> Result<Self, RpcTransportError> {
+        match preference {
+            TransportPreference::DirectOnly => Self::connect(addr, false).await,
+            TransportPreference::Auto => connect_direct_then_relay(addr).await,
+            TransportPreference::CompletionFirst => {
+                match tokio::time::timeout(COMPLETION_FIRST_DIRECT_BUDGET, Self::connect(addr.clone(), false)).await {
+                    Ok(Ok(client)) => Ok(client),
+                    Ok(Err(error)) => {
+                        tracing::warn!("direct data connect failed ({error}); completion first: the relay");
+                        Self::connect(addr, true).await
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "no direct data path within {COMPLETION_FIRST_DIRECT_BUDGET:?}; completion first: the relay"
+                        );
+                        Self::connect(addr, true).await
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One file over QUIC, as a [`ChunkSource`] for the bench (a runtime of its own drives the async client).
 pub struct QuicChunkSource {
     rt: tokio::runtime::Runtime,
