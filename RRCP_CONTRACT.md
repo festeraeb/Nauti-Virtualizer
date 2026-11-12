@@ -89,7 +89,7 @@ shell on another host, or any out-of-band channel to execute.
     "backend": "llama",
     "args": ["--ctx-size", "8192"]
   },
-  "policy": { "scope": "forge.inference", "max_wall_ms": 300000 }
+  "policy": { "scope": "forge.inference", "max_wall_ms": 300000, "priority": "normal" }
 }
 ```
 
@@ -105,6 +105,11 @@ Field rules:
   reject before touching hardware.
 - `policy.scope` MUST be present; the runner refuses scopes it was not
   configured to serve (sandbox rule: a node serves only its scopes).
+- `policy.priority` is OPTIONAL, ∈ `normal | urgent`, default `normal`.
+  Any other value → `bad-enum`. It names the requester's intent, not a
+  transport: the schema stays transport-independent. How a runner honors
+  `urgent` (for example which fabric transport it prefers for a bulk
+  transfer) is the runner's own policy, outside this contract.
 
 ## §3 Result envelope (`result`)
 
