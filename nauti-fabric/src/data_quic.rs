@@ -354,6 +354,11 @@ impl QuicDataClient {
     }
 }
 
+/// The bulk path's observability line: the file, its byte length and the path the connection took.
+pub fn bulk_path_line(file: &str, bytes: u64, relayed: bool, path: &str) -> String {
+    format!("bulk {file}: {bytes} bytes over {} ({path})", if relayed { "relay" } else { "direct" })
+}
+
 /// The bulk path's connect: the direct path first, and when that fails (timeout or error), the relay.
 pub async fn connect_direct_then_relay(addr: EndpointAddr) -> Result<QuicDataClient, RpcTransportError> {
     match QuicDataClient::connect(addr.clone(), false).await {
@@ -383,7 +388,9 @@ impl QuicChunkSource {
     /// The bulk path: the direct path first, the relay when that fails ([`connect_direct_then_relay`]).
     pub fn connect_auto(addr: EndpointAddr, file: &str) -> io::Result<Self> {
         let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
-        let client = rt.block_on(connect_direct_then_relay(addr)).map_err(io::Error::other)?;
+        let mut client = rt.block_on(connect_direct_then_relay(addr)).map_err(io::Error::other)?;
+        let bytes = rt.block_on(client.stream.stat(file)).map_err(io::Error::other)?;
+        tracing::info!("{}", bulk_path_line(file, bytes, client.is_relayed(), &client.path()));
         let relay = client.is_relayed();
         Ok(Self { rt, client, file: file.into(), relay })
     }
