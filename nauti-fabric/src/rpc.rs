@@ -373,6 +373,9 @@ pub fn prefer_direct(addr: EndpointAddr) -> EndpointAddr {
     }
 }
 
+/// How long the control RPC's direct connect may take before it falls back to the relay.
+pub const CONTROL_DIRECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// A connected controller session, able to issue [`RpcRequest`]s against a
 /// remote agent and await matching [`RpcResponse`]s.
 pub struct AgentClient {
@@ -403,15 +406,57 @@ impl AgentClient {
             .bind()
             .await
             .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
-        let connection = endpoint
-            .connect(prefer_direct(addr), ALPN)
-            .await
-            .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
+
+        // Try direct connect with timeout, then fall back to relay
+        let connection = match tokio::time::timeout(
+            CONTROL_DIRECT_TIMEOUT,
+            endpoint.connect(prefer_direct(addr.clone()), ALPN),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(e)) => {
+                let why = e.to_string();
+                warn!(error = %why, "agent rpc: direct connect failed; trying the relay");
+                Self::connect_via_relay(&endpoint, addr, why).await?
+            }
+            Err(_elapsed) => {
+                let why = format!("timed out after {CONTROL_DIRECT_TIMEOUT:?}");
+                warn!(error = %why, "agent rpc: direct connect failed; trying the relay");
+                Self::connect_via_relay(&endpoint, addr, why).await?
+            }
+        };
+
         let (send, recv) = connection
             .open_bi()
             .await
             .map_err(|error| RpcTransportError::Iroh(error.to_string()))?;
         Ok(Self { endpoint, connection, send, recv })
+    }
+
+    /// Connect via relay addresses from the given EndpointAddr.
+    async fn connect_via_relay(
+        endpoint: &Endpoint,
+        addr: EndpointAddr,
+        why: String,
+    ) -> Result<Connection, RpcTransportError> {
+        let relays: std::collections::BTreeSet<TransportAddr> = addr
+            .addrs
+            .iter()
+            .filter(|a| matches!(a, TransportAddr::Relay(_)))
+            .cloned()
+            .collect();
+        if relays.is_empty() {
+            return Err(RpcTransportError::Iroh(format!(
+                "direct connect failed ({why}) and the agent advertises no relay"
+            )));
+        }
+        endpoint.online().await;
+        let relay_addr = EndpointAddr { id: addr.id, addrs: relays };
+        endpoint
+            .connect(relay_addr, ALPN)
+            .await
+            .map_err(|error| RpcTransportError::Iroh(error.to_string()))
     }
 
     /// Sends a request and awaits its response on the shared bidi stream.
