@@ -321,8 +321,14 @@ impl QuicDataClient {
         } else {
             prefer_direct(addr)
         };
-        let connection =
-            endpoint.connect(addr, DATA_ALPN).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+        let connection = if relay {
+            endpoint.connect(addr, DATA_ALPN).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?
+        } else {
+            tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, endpoint.connect(addr, DATA_ALPN))
+                .await
+                .map_err(|_| RpcTransportError::Timeout(DIRECT_CONNECT_TIMEOUT))?
+                .map_err(|e| RpcTransportError::Iroh(e.to_string()))?
+        };
         let (send, recv) = connection.open_bi().await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
         Ok(Self { _endpoint: endpoint, connection, stream: DataStream::new(recv, send) })
     }
