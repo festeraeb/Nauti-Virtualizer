@@ -25,6 +25,9 @@ use std::sync::{Arc, Mutex};
 /// ALPN of the data protocol.
 pub const DATA_ALPN: &[u8] = b"nauti-fabric/data/1";
 
+/// How long a direct (non-relay) data connect may take before it is given up.
+pub const DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A queue pair's numbers, as the control link carries them (gid as 32 hex digits).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QpInfo {
@@ -307,19 +310,29 @@ pub struct QuicDataClient {
 impl QuicDataClient {
     /// Connects over the server's direct addresses, or, with `relay`, over its relay alone.
     pub async fn connect(addr: EndpointAddr, relay: bool) -> Result<Self, RpcTransportError> {
-        let endpoint = Endpoint::bind(presets::N0).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+        // The no-relay refusal needs no endpoint: check before binding (bind
+        // can block on relay DNS), so relay=true never makes a direct attempt.
         let addr = if relay {
             let a = relay_only(addr);
             if a.addrs.is_empty() {
                 return Err(RpcTransportError::Iroh("the server advertises no relay".into()));
             }
-            endpoint.online().await;
             a
         } else {
             prefer_direct(addr)
         };
-        let connection =
-            endpoint.connect(addr, DATA_ALPN).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+        let endpoint = Endpoint::bind(presets::N0).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
+        if relay {
+            endpoint.online().await;
+        }
+        let connection = if relay {
+            endpoint.connect(addr, DATA_ALPN).await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?
+        } else {
+            tokio::time::timeout(DIRECT_CONNECT_TIMEOUT, endpoint.connect(addr, DATA_ALPN))
+                .await
+                .map_err(|_| RpcTransportError::Timeout(DIRECT_CONNECT_TIMEOUT))?
+                .map_err(|e| RpcTransportError::Iroh(e.to_string()))?
+        };
         let (send, recv) = connection.open_bi().await.map_err(|e| RpcTransportError::Iroh(e.to_string()))?;
         Ok(Self { _endpoint: endpoint, connection, stream: DataStream::new(recv, send) })
     }

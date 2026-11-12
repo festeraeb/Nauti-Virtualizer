@@ -139,6 +139,8 @@ pub enum RpcTransportError {
     Json(#[from] serde_json::Error),
     #[error("iroh transport error: {0}")]
     Iroh(String),
+    #[error("timed out after {0:?}")]
+    Timeout(Duration),
 }
 
 pub(crate) async fn write_frame<W: AsyncWriteExt + Unpin>(
