@@ -408,7 +408,14 @@ impl Fabric {
             }
         }
         crate::hwinfo::discover_hardware(&node, &mut new_resources);
+        self.apply_inventory(new_resources)
+    }
 
+    /// The diff half of [`Self::refresh_local`]: make the registry match
+    /// `new_resources`. Split out so the diff can be tested on a fixed
+    /// inventory; `refresh_local` reads the live host, whose disk and GPU
+    /// set can change between two calls.
+    pub fn apply_inventory(&self, new_resources: Vec<Resource>) -> RefreshReport {
         let new_ids: std::collections::BTreeSet<String> =
             new_resources.iter().map(|r| r.id.clone()).collect();
         let current_ids: std::collections::BTreeSet<String> = self
@@ -1118,18 +1125,56 @@ mod tests {
         assert_eq!(current, added, "every resource on this host was added");
     }
 
+    fn test_resource(id: &str) -> Resource {
+        Resource {
+            id: id.into(),
+            kind: ResourceKind::Device,
+            capacity: 1,
+            unit: "device".into(),
+            node: "test-node".into(),
+            state: ResourceState::Available,
+            exclusive: true,
+            attributes: BTreeMap::new(),
+        }
+    }
+
+    // These three run on a fixed inventory. The earlier version called
+    // refresh_local twice and failed whenever the host's disk set changed
+    // between the two calls (seen 2026-10-11 and 2026-11-12).
     #[test]
-    fn refresh_local_is_idempotent_on_a_second_call() {
+    fn apply_inventory_is_idempotent_on_a_second_call() {
         let fabric = Fabric::default();
-        let first = fabric.refresh_local("test-node");
-        let second = fabric.refresh_local("test-node");
-        // The first call adds every host resource. The second call adds
-        // nothing (everything is already there) and removes nothing.
+        let inventory = vec![test_resource("device.0"), test_resource("device.1")];
+        let first = fabric.apply_inventory(inventory.clone());
+        let second = fabric.apply_inventory(inventory);
+        assert_eq!(first.added, vec!["device.0".to_string(), "device.1".to_string()]);
         assert!(second.added.is_empty(), "second refresh adds nothing");
         assert!(second.removed.is_empty(), "second refresh removes nothing");
         assert!(second.blocked_by_lease.is_empty());
-        // Sanity: the first call did at least add *something* on this host
-        // (CPU + memory at minimum).
-        assert!(!first.added.is_empty(), "first refresh added host resources");
+        assert_eq!(fabric.resources().len(), 2);
+    }
+
+    #[test]
+    fn apply_inventory_removes_what_is_gone_and_adds_what_is_new() {
+        let fabric = Fabric::default();
+        fabric.apply_inventory(vec![test_resource("device.0"), test_resource("device.1")]);
+        let report = fabric.apply_inventory(vec![test_resource("device.1"), test_resource("device.2")]);
+        assert_eq!(report.added, vec!["device.2".to_string()]);
+        assert_eq!(report.removed, vec!["device.0".to_string()]);
+        assert!(report.blocked_by_lease.is_empty());
+        assert!(fabric.resource("device.0").is_none());
+    }
+
+    #[test]
+    fn apply_inventory_keeps_a_leased_resource_that_disappeared() {
+        let fabric = Fabric::default();
+        fabric.apply_inventory(vec![test_resource("device.0")]);
+        let _lease = fabric
+            .lease_exclusive("device.0", "mission-a", Duration::from_secs(30))
+            .unwrap();
+        let report = fabric.apply_inventory(Vec::new());
+        assert!(report.removed.is_empty());
+        assert_eq!(report.blocked_by_lease, vec!["device.0".to_string()]);
+        assert!(fabric.resource("device.0").is_some());
     }
 }
