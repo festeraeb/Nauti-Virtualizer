@@ -999,6 +999,7 @@ fn data_bench(
     rounds: usize,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
     use nauti_fabric::data::{ChunkSource, MappedFile, bench, parse_size, scattered_offsets};
     use nauti_fabric::data_quic::{QuicChunkSource, TcpChunkSource};
     let chunk = parse_size(chunk).ok_or_else(|| format!("--chunk {chunk}: a size like 24K or 23M"))?;
